@@ -160,7 +160,7 @@ router.post('/webhook', async (req, res) => {
 
             // 3. Push transcript to Repair ASAP CRM
             if (customerNumber) {
-                const crmBaseUrl = process.env.CRM_BASE_URL; // e.g. https://repair-asap-crm-production.up.railway.app
+                const crmBaseUrl = process.env.CRM_BASE_URL; // e.g. https://app.bazas.ai
                 if (crmBaseUrl) {
                     try {
                         const durationSeconds = callData.call?.duration || callData.duration || 0;
@@ -247,7 +247,7 @@ router.post('/webhook', async (req, res) => {
                         logger.info('Initiating warm transfer from webhook', { callSid, target, callerName, summary });
 
                         // Call the CRM transfer endpoint
-                        const crmBaseUrl = process.env.CRM_BASE_URL || 'https://repair-asap-crm-production.up.railway.app';
+                        const crmBaseUrl = process.env.CRM_BASE_URL || 'https://app.bazas.ai';
                         console.log(`[TRANSFER] Step 1: calling CRM at ${crmBaseUrl}/api/twilio/voice/transfer`);
                         console.log(`[TRANSFER] Payload:`, JSON.stringify({ callSid, target, callerName, callerPhone, summary }));
                         
@@ -748,7 +748,7 @@ router.post('/transfer', async (req, res) => {
         logger.info('Initiating warm transfer', { callSid, target, callerName, summary });
 
         // Call the CRM transfer endpoint
-        const crmBaseUrl = process.env.CRM_BASE_URL || 'https://repair-asap-crm-production.up.railway.app';
+        const crmBaseUrl = process.env.CRM_BASE_URL || 'https://app.bazas.ai';
         const transferResponse = await fetch(`${crmBaseUrl}/api/twilio/voice/transfer`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
