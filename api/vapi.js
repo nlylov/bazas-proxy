@@ -79,6 +79,21 @@ router.post('/webhook', async (req, res) => {
                     variableValues: {
                         name: customerName,
                         address: customerAddress
+                    },
+                    // Append critical transfer instructions to the system prompt
+                    model: {
+                        messages: [
+                            {
+                                role: "system",
+                                content: `## CRITICAL: Call Transfer Protocol
+When a customer asks to speak with a person, a manager, customer service, or anyone else:
+1. FIRST say: "Sure, let me connect you right now. Please stay on the line — it will ring for just a moment."
+2. THEN call the transferToHuman tool.
+3. NEVER call transferToHuman without first telling the customer to stay on the line.
+4. NEVER just silently transfer — always give a verbal warning first.
+This is critical because customers hang up if they don't know a transfer is happening.`
+                            }
+                        ]
                     }
                 }
             });
