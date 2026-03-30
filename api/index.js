@@ -702,6 +702,100 @@ function detectChannel(event) {
     return 'sms'; // default
 }
 
+// --- ROUTE: Yelp via Zapier (Direct AI auto-reply) ---
+// Zapier "New Consumer Message" → POST here → returns AI response → Zapier "Create Message"
+app.post('/api/yelp-zapier', async (req, res) => {
+    const context = '/api/yelp-zapier';
+    logInfo(req, context, 'Yelp Zapier request received', { body: req.body });
+
+    try {
+        const {
+            consumer_name, consumer_phone, consumer_email,
+            message_content, message, lead_id, category, location
+        } = req.body;
+
+        const customerMessage = message_content || message || '';
+        const customerName = consumer_name || 'Yelp Customer';
+
+        if (!customerMessage && !category) {
+            return res.status(400).json({ error: 'Missing message_content or category' });
+        }
+
+        // Build context message if the message is empty but we have category
+        const effectiveMessage = customerMessage ||
+            `Hi, I'm looking for help with ${category || 'a handyman service'}. ${location ? `Location: ${location}` : ''}`;
+
+        // Fetch KB and generate AI response using the existing AI Hub
+        const { buildSystemPrompt, formatConversationHistory } = require('../lib/knowledge-base');
+        const { OpenAI: OpenAIClient } = require('openai');
+
+        const ai = new OpenAIClient({ apiKey: config.openai.apiKey });
+
+        const contactContext = {
+            name: customerName,
+            phone: consumer_phone || null,
+            email: consumer_email || null,
+            source: 'yelp',
+            tags: ['yelp', 'zapier-auto'],
+            notes: lead_id ? `Yelp Lead ID: ${lead_id}` : null,
+            conversationHistory: [],
+        };
+
+        const systemPrompt = await buildSystemPrompt('yelp', contactContext);
+
+        const completion = await ai.chat.completions.create({
+            model: 'gpt-4o',
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: effectiveMessage },
+            ],
+            max_tokens: 300,
+            temperature: 0.7,
+        });
+
+        const aiResponse = completion.choices[0]?.message?.content?.trim() || '';
+
+        // Log to Telegram
+        await sendToTelegram(
+            `📨 <b>Yelp (Zapier)</b>\n👤 ${customerName}\n💬 ${effectiveMessage.substring(0, 200)}\n🤖 ${aiResponse.substring(0, 300)}`,
+            'activity'
+        );
+
+        // Try to create/update contact in CRM for lead tracking
+        try {
+            const leadData = {
+                reqId: req.id,
+                timestamp: new Date().toISOString(),
+                source: 'Yelp (Zapier)',
+                name: customerName,
+                phone: consumer_phone ? normalizePhone(consumer_phone) : '',
+                email: consumer_email || '',
+                service: category || '',
+                notes: `Yelp Lead ID: ${lead_id || 'N/A'} | ${effectiveMessage.substring(0, 200)}`,
+            };
+            await sendLeadToCRM(leadData);
+        } catch (crmErr) {
+            logger.warn('Yelp-Zapier CRM sync failed (non-critical)', { error: crmErr.message });
+        }
+
+        // Return response for Zapier to send via "Create Message" action
+        res.json({
+            success: true,
+            message: aiResponse,
+            lead_id: lead_id || null,
+            customer_name: customerName,
+        });
+    } catch (error) {
+        logError(req, context, 'Yelp Zapier error', { error: error.message });
+        // Return a safe fallback message so Zapier can still respond
+        res.json({
+            success: false,
+            message: `Hi! Thank you for reaching out to Repair ASAP. We'd love to help! Could you share a few details about your project? Our team will get back to you with a quote shortly. You can also call us at (775) 310-7770.`,
+            error: error.message,
+        });
+    }
+});
+
 // Health check
 app.get('/api/health', (req, res) => res.json({
     status: 'ok',
