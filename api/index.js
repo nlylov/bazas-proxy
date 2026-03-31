@@ -761,19 +761,28 @@ app.post('/api/yelp-zapier', async (req, res) => {
             'activity'
         );
 
-        // Try to create/update contact in CRM for lead tracking
+        // Sync lead to CRM (custom CRM, not GHL)
         try {
-            const leadData = {
-                reqId: req.id,
-                timestamp: new Date().toISOString(),
-                source: 'Yelp (Zapier)',
-                name: customerName,
-                phone: consumer_phone ? normalizePhone(consumer_phone) : '',
-                email: consumer_email || '',
-                service: category || '',
-                notes: `Yelp Lead ID: ${lead_id || 'N/A'} | ${effectiveMessage.substring(0, 200)}`,
-            };
-            await sendLeadToCRM(leadData);
+            const crmUrl = process.env.CRM_BASE_URL || 'https://crm.asap.repair';
+            const crmRes = await fetch(`${crmUrl}/api/webhooks/yelp`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-webhook-secret': process.env.CRM_WEBHOOK_SECRET || '',
+                },
+                body: JSON.stringify({
+                    name: customerName,
+                    phone: consumer_phone ? normalizePhone(consumer_phone) : null,
+                    email: consumer_email || null,
+                    service: category || null,
+                    message: effectiveMessage,
+                    lead_id: lead_id || null,
+                    ai_response: aiResponse,
+                    location: location || null,
+                }),
+            });
+            const crmData = await crmRes.json();
+            logger.info('CRM Yelp sync OK', { contactId: crmData.contactId, conversationId: crmData.conversationId });
         } catch (crmErr) {
             logger.warn('Yelp-Zapier CRM sync failed (non-critical)', { error: crmErr.message });
         }
