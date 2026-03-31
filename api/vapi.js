@@ -172,59 +172,30 @@ This is critical because customers hang up if they don't know a transfer is happ
             const tgMessage = `📞 <b>Vapi AI Call Ended</b>\nPhone: ${customerNumber || 'Unknown'}\n\n<b>Summary:</b>\n${summary || 'No summary'}\n\n<b>Recording:</b>\n${recordingUrl || 'No recording'}\n\n<b>Transcript:</b>\n${safeTranscript}`;
             await sendToTelegram(tgMessage, 'leads');
 
-            // Push a generic note to GHL CRM here, creating the contact if they don't exist
+            // Save call data to CRM
             if (customerNumber) {
-                let contact = await lookupContactByPhone(customerNumber);
-                let contactId = contact?.id;
-
-                // Auto-create contact for callers who hung up before booking
-                if (!contactId) {
-                    const { sendLeadToCRM } = require('../lib/crmService');
-                    const crmRes = await sendLeadToCRM({
-                        name: 'Unknown Caller (Voice AI)',
-                        phone: customerNumber,
-                        service: 'General Inquiry',
-                    });
-                    if (crmRes.success) {
-                        contactId = crmRes.contactId;
-                    }
-                }
-
-                if (contactId) {
-                    const apiKey = process.env.PROSBUDDY_API_TOKEN;
-                    if (apiKey) {
-                        try {
-                            // 1. Add Note
-                            await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, {
-                                method: 'POST',
-                                headers: {
-                                    'Authorization': `Bearer ${apiKey}`,
-                                    'Content-Type': 'application/json',
-                                    'Version': '2021-07-28'
-                                },
-                                body: JSON.stringify({
-                                    body: `[Vapi AI Call]\nSummary: ${summary || 'None'}\nRecording: ${recordingUrl || 'None'}\nTranscript: ${transcript}`,
-                                    userId: process.env.PROSBUDDY_LOCATION_ID
-                                })
-                            });
-
-                            // 2. Add Internal Comment to Conversation history
-                            await fetch(`https://services.leadconnectorhq.com/conversations/messages`, {
-                                method: 'POST',
-                                headers: {
-                                    'Authorization': `Bearer ${apiKey}`,
-                                    'Content-Type': 'application/json',
-                                    'Version': '2021-04-15'
-                                },
-                                body: JSON.stringify({
-                                    type: 'InternalComment',
-                                    contactId: contact.id,
-                                    message: `📞 [Vapi AI Call Log]\nSummary: ${summary || 'None'}\nRecording: ${recordingUrl || 'None'}\nTranscript: ${transcript ? transcript.substring(0, 500) + '...' : ''}`
-                                })
-                            });
-                        } catch (err) {
-                            logger.error('Failed to add GHL note', err);
-                        }
+                const crmUrl = process.env.NEW_CRM_VAPI_URL || 'https://crm.asap.repair/api/webhooks/vapi';
+                const crmSecret = process.env.NEW_CRM_WEBHOOK_SECRET;
+                if (crmSecret) {
+                    try {
+                        await fetch(crmUrl, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-Webhook-Secret': crmSecret,
+                            },
+                            body: JSON.stringify({
+                                name: 'Unknown Caller (Voice AI)',
+                                phone: customerNumber,
+                                summary: summary || null,
+                                transcript: transcript || null,
+                                recordingUrl: recordingUrl || null,
+                                source: 'voice',
+                            }),
+                        });
+                        logger.info('Voice AI call saved to CRM', { phone: customerNumber });
+                    } catch (err) {
+                        logger.error('CRM vapi webhook error', { error: err.message });
                     }
                 }
             }
@@ -651,18 +622,33 @@ router.post('/book', async (req, res) => {
             });
         }
 
-        // Ensure we have a contact ID to book against (upsert the contact)
+        // Ensure we have a contact ID to book against (upsert via CRM)
         let contactId = null;
         if (phone) {
-            const { sendLeadToCRM } = require('../lib/crmService');
-            const crmRes = await sendLeadToCRM({
-                name: name || 'Caller',
-                phone: phone,
-                service: service || 'Handyman',
-                address: address || undefined
-            });
-            if (crmRes.success) {
-                contactId = crmRes.contactId;
+            const crmUrl = process.env.NEW_CRM_WEBHOOK_URL || 'https://crm.asap.repair/api/webhooks/website';
+            const crmSecret = process.env.NEW_CRM_WEBHOOK_SECRET;
+            if (crmSecret) {
+                try {
+                    const crmRes = await fetch(crmUrl, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Webhook-Secret': crmSecret,
+                        },
+                        body: JSON.stringify({
+                            name: name || 'Caller',
+                            phone: phone,
+                            service: service || 'Handyman',
+                            address: address || '',
+                        }),
+                    });
+                    if (crmRes.ok) {
+                        const data = await crmRes.json();
+                        contactId = data.contactId || null;
+                    }
+                } catch (err) {
+                    logger.error('CRM contact upsert error', { error: err.message });
+                }
             }
         }
 
