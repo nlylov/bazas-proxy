@@ -768,7 +768,7 @@ app.post('/api/yelp-zapier', async (req, res) => {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'x-webhook-secret': process.env.CRM_WEBHOOK_SECRET || '',
+                    'x-webhook-secret': process.env.NEW_CRM_WEBHOOK_SECRET || '',
                 },
                 body: JSON.stringify({
                     name: customerName,
