@@ -2,8 +2,46 @@ const express = require('express');
 const { logInfo, logError, logger } = require('../lib/utils/log');
 const { getAvailableSlots, bookAppointment } = require('../lib/calendarService');
 const { sendToTelegram } = require('../lib/telegram');
+const { fetchKnowledgeBase } = require('../lib/knowledge-base');
 
 const router = express.Router();
+
+/**
+ * Build a voice-friendly pricing prompt from KB data.
+ * This overrides the hardcoded pricing in Vapi's assistant config.
+ */
+function buildVoicePricingPrompt(kb) {
+    if (!kb || !kb.services || kb.services.length === 0) {
+        return ''; // No KB data — Vapi's built-in prompt will be used as fallback
+    }
+
+    const pricingLines = kb.services
+        .map(s => `- ${s.name}: ${s.priceRange}`)
+        .join('\n');
+
+    const minimum = kb.policies?.minimumVisit || '$99';
+    const warranty = kb.policies?.warranty || '1-year labor warranty, 60-day parts warranty';
+    const payment = kb.policies?.payment || 'Cash, Zelle, Venmo, Card, Apple Pay, Google Pay';
+    const doNotDo = kb.policies?.doNotDo || '';
+
+    let prompt = `## PRICING UPDATE (from Knowledge Base — USE THESE PRICES, they override any older values)
+${pricingLines}
+
+Minimum visit charge: ${minimum}
+Warranty: ${warranty}
+Payment: ${payment}`;
+
+    if (doNotDo) {
+        prompt += `\n\nWe do NOT do: ${doNotDo}`;
+    }
+
+    // Include company hours if available
+    if (kb.companyInfo?.hours) {
+        prompt += `\n\nHours: Mon-Fri ${kb.companyInfo.hours.weekday || '9:00 AM - 7:00 PM'}, Sat-Sun ${kb.companyInfo.hours.weekend || '10:00 AM - 4:00 PM'}`;
+    }
+
+    return prompt;
+}
 
 /**
  * Helper: Look up a contact in GHL by phone number
@@ -55,7 +93,7 @@ router.post('/webhook', async (req, res) => {
         const type = payload?.message?.type;
         logger.info(`Vapi Webhook Received: ${type}`);
 
-        // 1. Assistant Request (Before Call Starts) - Inject Context
+        // 1. Assistant Request (Before Call Starts) - Inject Context + KB Pricing
         if (type === 'assistant-request') {
             const customerNumber = payload.message?.call?.customer?.number;
             let firstMessage = `Hi! This is Repair ASAP. How can I help you today?`;
@@ -71,6 +109,30 @@ router.post('/webhook', async (req, res) => {
                 }
             }
 
+            // Fetch KB data for dynamic pricing
+            let kbPricingPrompt = '';
+            try {
+                const kb = await fetchKnowledgeBase();
+                kbPricingPrompt = buildVoicePricingPrompt(kb);
+                if (kbPricingPrompt) {
+                    logger.info(`[VAPI] Injected KB pricing (${kb?.services?.length || 0} services) into Anna's prompt`);
+                }
+            } catch (kbErr) {
+                logger.warn('[VAPI] KB fetch failed, using Vapi built-in pricing', kbErr.message);
+            }
+
+            // Build the system prompt override (KB pricing + transfer protocol)
+            const systemOverride = [
+                kbPricingPrompt,
+                `## CRITICAL: Call Transfer Protocol
+When a customer asks to speak with a person, a manager, customer service, or anyone else:
+1. FIRST say: "Sure, let me connect you right now. Please stay on the line — it will ring for just a moment."
+2. THEN call the transferToHuman tool.
+3. NEVER call transferToHuman without first telling the customer to stay on the line.
+4. NEVER just silently transfer — always give a verbal warning first.
+This is critical because customers hang up if they don't know a transfer is happening.`
+            ].filter(Boolean).join('\n\n');
+
             // Return the specific Assistant ID and inject context into the System Prompt via overrides
             return res.json({
                 assistantId: "2d0ec368-7ab0-4b0e-a516-78157cb96b0c",
@@ -80,18 +142,12 @@ router.post('/webhook', async (req, res) => {
                         name: customerName,
                         address: customerAddress
                     },
-                    // Append critical transfer instructions to the system prompt
+                    // Append KB pricing + transfer instructions to the system prompt
                     model: {
                         messages: [
                             {
                                 role: "system",
-                                content: `## CRITICAL: Call Transfer Protocol
-When a customer asks to speak with a person, a manager, customer service, or anyone else:
-1. FIRST say: "Sure, let me connect you right now. Please stay on the line — it will ring for just a moment."
-2. THEN call the transferToHuman tool.
-3. NEVER call transferToHuman without first telling the customer to stay on the line.
-4. NEVER just silently transfer — always give a verbal warning first.
-This is critical because customers hang up if they don't know a transfer is happening.`
+                                content: systemOverride
                             }
                         ]
                     }
