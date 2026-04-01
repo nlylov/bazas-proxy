@@ -44,41 +44,42 @@ Payment: ${payment}`;
 }
 
 /**
- * Helper: Look up a contact in GHL by phone number
+ * Helper: Look up a contact in CRM by phone number
+ * Replaces GHL dependency — now all contact data comes from the CRM
  */
 async function lookupContactByPhone(phone) {
     if (!phone) return null;
     const digits = phone.replace(/\D/g, '');
     if (digits.length < 10) return null;
 
-    const apiKey = process.env.PROSBUDDY_API_TOKEN;
-    const locationId = process.env.PROSBUDDY_LOCATION_ID;
-    if (!apiKey || !locationId) return null;
+    const crmBaseUrl = process.env.CRM_BASE_URL || 'https://crm.asap.repair';
+    const crmSecret = process.env.NEW_CRM_WEBHOOK_SECRET;
+    if (!crmSecret) {
+        logger.warn('[VAPI] No CRM_WEBHOOK_SECRET — cannot look up contacts');
+        return null;
+    }
 
     const searchPhone = '+1' + digits.slice(-10);
     try {
         const resp = await fetch(
-            `https://services.leadconnectorhq.com/contacts/search/duplicate?locationId=${locationId}&number=${encodeURIComponent(searchPhone)}`,
+            `${crmBaseUrl}/api/contacts/lookup?phone=${encodeURIComponent(searchPhone)}`,
             {
                 headers: {
-                    'Authorization': `Bearer ${apiKey}`,
-                    'Version': '2021-07-28',
+                    'X-Webhook-Secret': crmSecret,
                 },
             }
         );
         const data = await resp.json();
-        const contact = data?.contact;
-        if (contact && contact.id) {
+        if (data?.found && data.id) {
             return {
-                id: contact.id,
-                name: contact.firstNameLowerCase ? (contact.firstName || contact.firstNameLowerCase) : (contact.contactName || ''),
-                email: contact.email || '',
-                address: contact.address1 ? `${contact.address1}${contact.city ? ', ' + contact.city : ''}` : '',
-                // If we need custom fields, we could fetch them here or extract from standard fields
+                id: data.id,
+                name: data.name || '',
+                email: data.email || '',
+                address: data.address || '',
             };
         }
     } catch (error) {
-        logger.error('Error looking up contact for Vapi', error);
+        logger.error('Error looking up contact in CRM for Vapi', error);
     }
     return null;
 }
