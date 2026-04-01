@@ -468,55 +468,36 @@ app.get('/api/calendar-slots', async (req, res) => {
     }
 });
 
-// Temporary endpoint to list all calendars in the location
+// [DEPRECATED] Calendars endpoint — use CRM calendar
 app.get('/api/admin/calendars', async (req, res) => {
-    try {
-        const apiKey = process.env.PROSBUDDY_API_TOKEN;
-        const locationId = process.env.PROSBUDDY_LOCATION_ID;
-        const response = await fetch(`https://services.leadconnectorhq.com/calendars/?locationId=${locationId}`, {
-            headers: { 'Authorization': `Bearer ${apiKey}`, 'Version': '2021-04-15' }
-        });
-        res.json(await response.json());
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    res.json({ message: 'Moved to CRM. Use crm.asap.repair/api/calendar-events' });
 });
 
-// Check if customer exists (returning customer detection)
+// Check if customer exists (now uses CRM instead of GHL)
 app.get('/api/check-customer', async (req, res) => {
     try {
         const { phone } = req.query;
         if (!phone) return res.json({ found: false });
-        const digits = phone.replace(/\D/g, '');
-        if (digits.length < 10) return res.json({ found: false });
 
-        const apiKey = process.env.PROSBUDDY_API_TOKEN;
-        const locationId = process.env.PROSBUDDY_LOCATION_ID;
-        if (!apiKey || !locationId) return res.json({ found: false });
+        const crmApiKey = process.env.CRM_API_KEY;
+        const crmBaseUrl = process.env.CRM_BASE_URL || 'https://crm.asap.repair';
+        if (!crmApiKey) return res.json({ found: false });
 
-        const searchPhone = '+1' + digits.slice(-10);
-        const resp = await fetch(
-            `https://services.leadconnectorhq.com/contacts/search/duplicate?locationId=${locationId}&number=${encodeURIComponent(searchPhone)}`,
-            {
-                headers: {
-                    'Authorization': `Bearer ${apiKey}`,
-                    'Version': '2021-07-28',
-                },
-            }
+        const crmRes = await fetch(
+            `${crmBaseUrl}/api/ai/context?phone=${encodeURIComponent(phone)}`,
+            { headers: { 'x-api-key': crmApiKey } }
         );
-        const data = await resp.json();
-        const contact = data?.contact;
-        if (contact && contact.id) {
-            res.json({
-                found: true,
-                name: contact.firstNameLowerCase ? (contact.firstName || contact.firstNameLowerCase) : (contact.contactName || ''),
-            });
+        if (!crmRes.ok) return res.json({ found: false });
+
+        const data = await crmRes.json();
+        if (data.found && data.contact) {
+            res.json({ found: true, name: data.contact.name || '' });
         } else {
             res.json({ found: false });
         }
     } catch (error) {
         logError(req, '/api/check-customer', 'Error', error);
-        res.json({ found: false }); // Non-critical, fail silently
+        res.json({ found: false });
     }
 });
 
@@ -594,6 +575,9 @@ app.post('/api/ai-hub/webhook', async (req, res) => {
             body: event.body || event.message || event.messageBody || '',
             channel: event.channel || detectChannel(event),
             attachments: event.attachments || [],
+            // Phone for CRM lookup (GHL contactId ≠ CRM contactId)
+            phone: event.phone || event.contact_phone || event.contactPhone ||
+                   event.customData?.phone || event.customData?.contact_phone || null,
         };
 
         // Skip outbound (owner) messages — double guard (also checked in ai-hub.js)
