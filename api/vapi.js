@@ -173,39 +173,22 @@ This is critical because customers hang up if they don't know a transfer is happ
             const tgMessage = `📞 <b>Vapi AI Call Ended</b>\nPhone: ${customerNumber || 'Unknown'}\n\n<b>Summary:</b>\n${summary || 'No summary'}\n\n<b>Recording:</b>\n${recordingUrl || 'No recording'}\n\n<b>Transcript:</b>\n${safeTranscript}`;
             await sendToTelegram(tgMessage, 'leads');
 
-            // Save call data to CRM
-            if (customerNumber) {
-                const crmUrl = process.env.NEW_CRM_VAPI_URL || 'https://crm.asap.repair/api/webhooks/vapi';
-                const crmSecret = process.env.NEW_CRM_WEBHOOK_SECRET;
-                if (crmSecret) {
-                    try {
-                        await fetch(crmUrl, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'X-Webhook-Secret': crmSecret,
-                            },
-                            body: JSON.stringify({
-                                name: 'Unknown Caller (Voice AI)',
-                                phone: customerNumber,
-                                summary: summary || null,
-                                transcript: transcript || null,
-                                recordingUrl: recordingUrl || null,
-                                source: 'voice',
-                            }),
-                        });
-                        logger.info('Voice AI call saved to CRM', { phone: customerNumber });
-                    } catch (err) {
-                        logger.error('CRM vapi webhook error', { error: err.message });
-                    }
-                }
-            }
-
-            // 3. Push transcript to Repair ASAP CRM
+            // Save call data to CRM (via transcript endpoint only — single source of truth)
             if (customerNumber) {
                 const crmBaseUrl = process.env.CRM_BASE_URL; // e.g. https://app.bazas.ai
                 if (crmBaseUrl) {
                     try {
+                        // Look up caller name from CRM
+                        let callerName = '';
+                        try {
+                            const contact = await lookupContactByPhone(customerNumber);
+                            if (contact && contact.name) {
+                                callerName = contact.name;
+                            }
+                        } catch (lookupErr) {
+                            logger.warn('CRM contact lookup failed during call save', lookupErr.message);
+                        }
+
                         const durationSeconds = callData.call?.duration || callData.duration || 0;
                         const durationMin = Math.floor(durationSeconds / 60);
                         const durationSec = durationSeconds % 60;
@@ -213,6 +196,7 @@ This is critical because customers hang up if they don't know a transfer is happ
 
                         const crmPayload = {
                             from: customerNumber,
+                            callerName: callerName || undefined,
                             callSid: callData.call?.id || '',
                             transcript: transcript || '',
                             summary: summary || '',
@@ -228,7 +212,7 @@ This is critical because customers hang up if they don't know a transfer is happ
                         });
 
                         if (crmResponse.ok) {
-                            logger.info('VAPI transcript pushed to CRM', { customerNumber });
+                            logger.info('VAPI transcript pushed to CRM', { customerNumber, callerName });
                         } else {
                             logger.warn('CRM transcript push failed', { status: crmResponse.status });
                         }
