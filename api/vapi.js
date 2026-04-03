@@ -100,6 +100,7 @@ router.post('/webhook', async (req, res) => {
             let firstMessage = `Hi! This is Repair ASAP. How can I help you today?`;
             let customerName = '';
             let customerAddress = '';
+            let crmContextPrompt = '';
 
             if (customerNumber) {
                 const contact = await lookupContactByPhone(customerNumber);
@@ -107,7 +108,56 @@ router.post('/webhook', async (req, res) => {
                     customerName = contact.name;
                     customerAddress = contact.address || '';
                     const firstName = contact.name.split(' ')[0];
-                    firstMessage = `Hi ${firstName}, this is Anna from Repair ASAP! How can I help you today?`;
+
+                    // Build CRM context for Anna's system prompt
+                    const contextParts = [];
+                    contextParts.push(`## Caller Context (from CRM)`);
+                    contextParts.push(`- Name: ${contact.name}`);
+                    if (contact.address) contextParts.push(`- Address on file: ${contact.address}`);
+                    if (contact.notes) contextParts.push(`- Notes: ${contact.notes}`);
+                    contextParts.push(`- Status: ${contact.status || 'lead'} (${contact.jobCount || 0} total jobs)`);
+
+                    // Recent jobs
+                    if (contact.recentJobs && contact.recentJobs.length > 0) {
+                        contextParts.push(`\n### Recent Jobs:`);
+                        contact.recentJobs.forEach((job, i) => {
+                            contextParts.push(`${i + 1}. "${job.title}" — status: ${job.status}`);
+                            if (job.description) contextParts.push(`   Description: ${job.description}`);
+                            if (job.scheduledDate) contextParts.push(`   Scheduled: ${new Date(job.scheduledDate).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}${job.scheduledTime ? ' at ' + job.scheduledTime : ''}`);
+                            if (job.address) contextParts.push(`   Job address: ${job.address}`);
+                            if (job.notes) contextParts.push(`   Internal notes: ${job.notes}`);
+                        });
+                    }
+
+                    // Upcoming appointments
+                    if (contact.upcomingAppointments && contact.upcomingAppointments.length > 0) {
+                        contextParts.push(`\n### Upcoming Appointments:`);
+                        contact.upcomingAppointments.forEach((apt, i) => {
+                            const date = new Date(apt.startTime).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
+                            const time = new Date(apt.startTime).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+                            contextParts.push(`${i + 1}. "${apt.title}" — ${date} at ${time} (${apt.status})`);
+                            if (apt.service) contextParts.push(`   Service: ${apt.service}`);
+                            if (apt.address) contextParts.push(`   Address: ${apt.address}`);
+                        });
+                    }
+
+                    contextParts.push(`\n### Instructions for returning callers:`);
+                    contextParts.push(`- Address the caller by first name: "${firstName}"`);
+                    contextParts.push(`- If they have active/scheduled jobs, reference them naturally. Example: "Are you calling about the [job title]?"`);
+                    contextParts.push(`- Never ask for information you already have (name, address, phone).`);
+                    contextParts.push(`- If same address as last time: "Same address as last time — [address], right?"`);
+
+                    crmContextPrompt = contextParts.join('\n');
+
+                    // Customize first message based on context
+                    const activeJob = (contact.recentJobs || []).find(j => j.status === 'scheduled' || j.status === 'in_progress');
+                    if (activeJob) {
+                        firstMessage = `Hi ${firstName}, this is Anna from Repair ASAP! Are you calling about the ${activeJob.title.toLowerCase()}?`;
+                    } else {
+                        firstMessage = `Hi ${firstName}, this is Anna from Repair ASAP! How can I help you today?`;
+                    }
+
+                    logger.info(`[VAPI] CRM context loaded for ${firstName}: ${contact.jobCount} jobs, ${(contact.recentJobs || []).length} recent, ${(contact.upcomingAppointments || []).length} appointments`);
                 }
             }
 
@@ -123,8 +173,9 @@ router.post('/webhook', async (req, res) => {
                 logger.warn('[VAPI] KB fetch failed, using Vapi built-in pricing', kbErr.message);
             }
 
-            // Build the system prompt override (KB pricing + transfer protocol)
+            // Build the system prompt override (CRM context + KB pricing + transfer protocol)
             const systemOverride = [
+                crmContextPrompt,
                 kbPricingPrompt,
                 `## CRITICAL: Call Transfer Protocol
 When a customer asks to speak with a person, a manager, customer service, or anyone else:
