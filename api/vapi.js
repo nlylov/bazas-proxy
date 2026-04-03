@@ -405,6 +405,55 @@ This is critical because customers hang up if they don't know a transfer is happ
                         });
                     }
                 }
+                // Handle lookupCaller tool calls — returns caller context from CRM
+                else if (functionName === 'lookupCaller') {
+                    try {
+                        const callerPhone = payload.message?.call?.customer?.number || '';
+                        logger.info('[VAPI] lookupCaller tool called', { callerPhone });
+
+                        if (callerPhone) {
+                            const contact = await lookupContactByPhone(callerPhone);
+                            if (contact && contact.name) {
+                                logger.info('[VAPI] lookupCaller found contact', { name: contact.name });
+                                results.push({
+                                    toolCallId: toolCall.id,
+                                    result: JSON.stringify({
+                                        found: true,
+                                        name: contact.name,
+                                        address: contact.address || '',
+                                        isReturningCustomer: true,
+                                    })
+                                });
+                            } else {
+                                results.push({
+                                    toolCallId: toolCall.id,
+                                    result: JSON.stringify({
+                                        found: false,
+                                        name: '',
+                                        address: '',
+                                        isReturningCustomer: false,
+                                    })
+                                });
+                            }
+                        } else {
+                            results.push({
+                                toolCallId: toolCall.id,
+                                result: JSON.stringify({
+                                    found: false,
+                                    name: '',
+                                    address: '',
+                                    isReturningCustomer: false,
+                                })
+                            });
+                        }
+                    } catch (e) {
+                        logger.error('[VAPI] lookupCaller error', e);
+                        results.push({
+                            toolCallId: toolCall.id,
+                            result: JSON.stringify({ found: false, name: '', address: '', isReturningCustomer: false })
+                        });
+                    }
+                }
                 // Unknown tool - acknowledge
                 else {
                     logger.warn(`Unknown tool call: ${functionName}`);
