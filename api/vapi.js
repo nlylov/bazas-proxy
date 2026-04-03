@@ -145,6 +145,8 @@ This is critical because customers hang up if they don't know a transfer is happ
                     },
                     // Append KB pricing + transfer instructions to the system prompt
                     model: {
+                        provider: "openai",
+                        model: "gpt-4o-mini",
                         messages: [
                             {
                                 role: "system",
