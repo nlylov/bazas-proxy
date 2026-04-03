@@ -106,7 +106,8 @@ router.post('/webhook', async (req, res) => {
                 if (contact && contact.name) {
                     customerName = contact.name;
                     customerAddress = contact.address || '';
-                    firstMessage = `Hi ${contact.name}, this is Anna from Repair ASAP! How can I help you today?`;
+                    const firstName = contact.name.split(' ')[0];
+                    firstMessage = `Hi ${firstName}, this is Anna from Repair ASAP! How can I help you today?`;
                 }
             }
 
