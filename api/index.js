@@ -763,7 +763,25 @@ app.post('/api/yelp-zapier', async (req, res) => {
             logger.warn('Yelp-Zapier CRM sync failed (non-critical)', { error: crmErr.message });
         }
 
-        // Return response for Zapier to send via "Create Message" action
+        // Send AI reply to Yelp via Zapier Catch Hook (replaces old Zapier Step 3)
+        const zapierSendUrl = process.env.ZAPIER_YELP_SEND_WEBHOOK;
+        if (zapierSendUrl && lead_id && aiResponse) {
+            try {
+                const zapRes = await fetch(zapierSendUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        lead_id: lead_id,
+                        message: aiResponse,
+                    }),
+                });
+                logger.info('Yelp reply sent via Catch Hook', { lead_id, status: zapRes.status });
+            } catch (zapErr) {
+                logger.warn('Yelp Catch Hook send failed', { error: zapErr.message });
+            }
+        }
+
+        // Return response (Zapier Step 3 no longer needed)
         res.json({
             success: true,
             message: aiResponse,
