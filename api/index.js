@@ -586,6 +586,16 @@ app.post('/api/ai-hub/webhook', async (req, res) => {
             return res.json({ skipped: true, message: '', aiResponse: '', reason: 'Outbound message from owner/team' });
         }
 
+        // ─── THUMBTACK BLOCK: CRM handles Thumbtack natively ────────
+        // The CRM's /api/webhooks/thumbtack endpoint now generates and sends
+        // AI auto-replies directly via the Thumbtack API + SMS bridge.
+        // If we also respond here via GHL, we get 2-4x duplicate messages.
+        // ALWAYS skip Thumbtack in the proxy — CRM is the single source of truth.
+        if (normalizedEvent.channel === 'thumbtack') {
+            logInfo(req, context, 'Thumbtack channel — CRM handles natively, proxy skipping', { contactId: normalizedEvent.contactId });
+            return res.json({ skipped: true, message: '', aiResponse: '', reason: 'Thumbtack handled by CRM natively' });
+        }
+
         // Dedup: prevent double-response when both "Contact Tag Added" + "Customer Replied" fire
         // for the same inbound message (race condition with two triggers + re-entry ON)
         const dedupKey = makeDedupKey(
