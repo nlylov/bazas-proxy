@@ -737,30 +737,82 @@ app.post('/api/yelp-zapier', async (req, res) => {
             'activity'
         );
 
-        // Sync lead to CRM (custom CRM, not GHL)
-        try {
-            const crmUrl = process.env.CRM_BASE_URL || 'https://crm.asap.repair';
-            const crmRes = await fetch(`${crmUrl}/api/webhooks/yelp`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-webhook-secret': process.env.NEW_CRM_WEBHOOK_SECRET || '',
-                },
-                body: JSON.stringify({
-                    name: customerName,
-                    phone: consumer_phone ? normalizePhone(consumer_phone) : null,
-                    email: consumer_email || null,
-                    service: category || null,
-                    message: effectiveMessage,
-                    lead_id: lead_id || null,
-                    ai_response: aiResponse,
-                    location: location || null,
-                }),
-            });
-            const crmData = await crmRes.json();
-            logger.info('CRM Yelp sync OK', { contactId: crmData.contactId, conversationId: crmData.conversationId });
-        } catch (crmErr) {
-            logger.warn('Yelp-Zapier CRM sync failed (non-critical)', { error: crmErr.message });
+        // Sync lead to CRM (custom CRM, not GHL) — with retry \u0026 status checking
+        let crmSynced = false;
+        const crmUrl = process.env.CRM_BASE_URL || 'https://crm.asap.repair';
+        const crmPayload = {
+            name: customerName,
+            phone: consumer_phone ? normalizePhone(consumer_phone) : null,
+            email: consumer_email || null,
+            service: category || null,
+            message: effectiveMessage,
+            lead_id: lead_id || null,
+            ai_response: aiResponse,
+            location: location || null,
+        };
+
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            try {
+                const crmRes = await fetch(`${crmUrl}/api/webhooks/yelp`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-webhook-secret': process.env.NEW_CRM_WEBHOOK_SECRET || '',
+                    },
+                    body: JSON.stringify(crmPayload),
+                });
+
+                if (!crmRes.ok) {
+                    const errBody = await crmRes.text().catch(() => '(no body)');
+                    logger.error(`CRM Yelp sync FAILED (attempt ${attempt})`, {
+                        status: crmRes.status,
+                        body: errBody.substring(0, 300),
+                        lead_id,
+                        customerName,
+                    });
+                    await sendToTelegram(
+                        `\u26a0\ufe0f <b>CRM Sync FAILED</b> (attempt ${attempt})\n` +
+                        `\ud83d\udc64 ${customerName}\n` +
+                        `\ud83c\udd94 Lead: ${lead_id || 'N/A'}\n` +
+                        `\u274c Status: ${crmRes.status}\n` +
+                        `\ud83d\udcdd Error: ${errBody.substring(0, 200)}`,
+                        'leads'
+                    );
+                    if (attempt < 2) {
+                        await new Promise(r => setTimeout(r, 2000)); // wait 2s before retry
+                        continue;
+                    }
+                } else {
+                    const crmData = await crmRes.json();
+                    crmSynced = true;
+                    logger.info('CRM Yelp sync OK', { contactId: crmData.contactId, conversationId: crmData.conversationId });
+                    break;
+                }
+            } catch (crmErr) {
+                logger.error(`CRM Yelp sync EXCEPTION (attempt ${attempt})`, { error: crmErr.message, lead_id, customerName });
+                await sendToTelegram(
+                    `\u274c <b>CRM Sync EXCEPTION</b> (attempt ${attempt})\n` +
+                    `\ud83d\udc64 ${customerName}\n` +
+                    `\ud83c\udd94 Lead: ${lead_id || 'N/A'}\n` +
+                    `\ud83d\udca5 ${crmErr.message}`,
+                    'leads'
+                );
+                if (attempt < 2) {
+                    await new Promise(r => setTimeout(r, 2000));
+                }
+            }
+        }
+
+        if (!crmSynced) {
+            await sendToTelegram(
+                `\ud83d\udea8 <b>LEAD NOT SAVED TO CRM!</b>\n` +
+                `\ud83d\udc64 ${customerName}\n` +
+                `\ud83d\udcf1 ${consumer_phone || 'No phone'}\n` +
+                `\ud83c\udd94 ${lead_id || 'No ID'}\n` +
+                `\ud83d\udd27 ${category || effectiveMessage.substring(0, 80)}\n` +
+                `\u2139\ufe0f The AI reply was sent to Yelp, but CRM has NO record of this lead. Manual entry needed.`,
+                'leads'
+            );
         }
 
         // Send AI reply to Yelp via Zapier Catch Hook (replaces old Zapier Step 3)
