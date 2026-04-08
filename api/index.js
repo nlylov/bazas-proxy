@@ -711,6 +711,24 @@ app.post('/api/yelp-zapier', async (req, res) => {
         const effectiveMessage = customerMessage ||
             `Hi, I'm looking for help with ${category || 'a handyman service'}. ${location ? `Location: ${location}` : ''}`;
 
+        // Check if AI is paused for this contact in CRM
+        const crmUrl = process.env.CRM_BASE_URL || 'https://crm.asap.repair';
+        try {
+            const pauseCheckUrl = `${crmUrl}/api/webhooks/yelp/check-pause?lead_id=${encodeURIComponent(lead_id || '')}&phone=${encodeURIComponent(consumer_phone || '')}`;
+            const pauseRes = await fetch(pauseCheckUrl, {
+                headers: { 'x-webhook-secret': process.env.NEW_CRM_WEBHOOK_SECRET || '' },
+            });
+            if (pauseRes.ok) {
+                const pauseData = await pauseRes.json();
+                if (pauseData.aiPaused || pauseData.dndAll) {
+                    logInfo(req, context, `AI paused/DND for contact — skipping auto-reply`, { lead_id, customerName });
+                    return res.json({ reply: '', skipped: true, reason: 'ai_paused' });
+                }
+            }
+        } catch (pauseErr) {
+            logger.warn('AI pause check failed (proceeding with reply)', { error: pauseErr.message });
+        }
+
         // Fetch KB and generate AI response using the existing AI Hub
         const { buildSystemPrompt, formatConversationHistory } = require('../lib/knowledge-base');
         const { OpenAI: OpenAIClient } = require('openai');
@@ -747,9 +765,8 @@ app.post('/api/yelp-zapier', async (req, res) => {
             'activity'
         );
 
-        // Sync lead to CRM (custom CRM, not GHL) — with retry \u0026 status checking
+        // Sync lead to CRM (custom CRM, not GHL) — with retry & status checking
         let crmSynced = false;
-        const crmUrl = process.env.CRM_BASE_URL || 'https://crm.asap.repair';
         const crmPayload = {
             name: customerName,
             phone: consumer_phone ? normalizePhone(consumer_phone) : null,
