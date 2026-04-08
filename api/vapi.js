@@ -185,7 +185,7 @@ router.post('/webhook', async (req, res) => {
                     const ragRes = await fetch(`${ragUrl}/query`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'X-API-Key': ragKey || '' },
-                        body: JSON.stringify({ query: ragQuery, mode: 'mix', top_k: 10 }),
+                        body: JSON.stringify({ org_id: process.env.CRM_ORG_ID || '', query: ragQuery, mode: 'mix', top_k: 10 }),
                         signal: AbortSignal.timeout(3000),
                     });
                     if (ragRes.ok) {
