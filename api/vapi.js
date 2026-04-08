@@ -173,10 +173,38 @@ router.post('/webhook', async (req, res) => {
                 logger.warn('[VAPI] KB fetch failed, using Vapi built-in pricing', kbErr.message);
             }
 
+            // Query LightRAG knowledge graph for caller context
+            let ragContextPrompt = '';
+            try {
+                const ragUrl = process.env.LIGHTRAG_URL;
+                const ragKey = process.env.LIGHTRAG_API_KEY;
+                if (ragUrl) {
+                    const ragQuery = customerName
+                        ? `Caller ${customerName} from ${customerNumber}`
+                        : `Incoming call from ${customerNumber}`;
+                    const ragRes = await fetch(`${ragUrl}/query`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-API-Key': ragKey || '' },
+                        body: JSON.stringify({ query: ragQuery, mode: 'mix', top_k: 10 }),
+                        signal: AbortSignal.timeout(3000),
+                    });
+                    if (ragRes.ok) {
+                        const ragData = await ragRes.json();
+                        if (ragData.context && ragData.context.length > 20) {
+                            ragContextPrompt = `## Additional Context from Knowledge Graph\n${ragData.context.substring(0, 1500)}`;
+                            logger.info(`[VAPI] RAG context loaded: ${ragData.context.length} chars`);
+                        }
+                    }
+                }
+            } catch (ragErr) {
+                logger.warn('[VAPI] RAG query failed (non-critical):', ragErr.message);
+            }
+
             // Build the system prompt override (CRM context + KB pricing + transfer protocol)
             const systemOverride = [
                 crmContextPrompt,
                 kbPricingPrompt,
+                ragContextPrompt,
                 `## CRITICAL: Call Transfer Protocol
 When a customer asks to speak with a person, a manager, customer service, or anyone else:
 1. FIRST say: "Sure, let me connect you right now. Please stay on the line — it will ring for just a moment."
