@@ -1,7 +1,6 @@
 // api/quote.js — Quote Form API Route
-// Handles form submissions, creates contact in CRM, and books appointments.
+// Handles form submissions, creates contact in CRM. Does NOT auto-book appointments.
 
-const { bookAppointment } = require('../lib/calendarService');
 const { logger } = require('../lib/utils/log');
 
 /**
@@ -64,42 +63,25 @@ async function handleQuoteSubmission(req, res) {
         }
 
         // ═══════════════════════════════════════════════════════
-        // STEP 2: Calendar booking (uses CRM calendar)
+        // STEP 2: Quote requests do NOT auto-book appointments
+        // The date/time from the form is saved as a note in CRM.
+        // An appointment should only be created after the customer
+        // explicitly confirms a time (via call, SMS, or chat).
         // ═══════════════════════════════════════════════════════
-        let bookingResult = null;
-        if (date && time) {
-            try {
-                bookingResult = await bookAppointment({
-                    contactId: crmContactId || null,
-                    startTime: time,
-                    service: service || 'Handyman Service',
-                    address: address || (zip ? `ZIP: ${zip}` : ''),
-                    contactName: name,
-                });
-                if (bookingResult.success) {
-                    logger.info('Quote form: appointment booked', {
-                        appointmentId: bookingResult.appointmentId,
-                        startTime: time,
-                    });
-                } else {
-                    logger.error('Quote form: booking failed', { error: bookingResult.error });
-                }
-            } catch (bookErr) {
-                logger.error('Quote form: booking error (non-critical)', bookErr);
-            }
+        if (date || time) {
+            logger.info('Quote form: preferred date/time noted (not auto-booking)', {
+                date, time, name, phone,
+            });
         }
 
         logger.info('Quote submission successful', {
             name, phone, service,
             crmOk,
-            booked: bookingResult?.success || false,
         });
         return res.json({
             success: true,
-            message: bookingResult?.success
-                ? `Quote request received and appointment booked!`
-                : 'Quote request received successfully',
-            booked: bookingResult?.success || false,
+            message: 'Quote request received successfully. We will get back to you shortly with a quote.',
+            booked: false,
         });
 
     } catch (error) {

@@ -183,7 +183,18 @@ When a customer asks to speak with a person, a manager, customer service, or any
 2. THEN call the transferToHuman tool.
 3. NEVER call transferToHuman without first telling the customer to stay on the line.
 4. NEVER just silently transfer — always give a verbal warning first.
-This is critical because customers hang up if they don't know a transfer is happening.`
+This is critical because customers hang up if they don't know a transfer is happening.`,
+                `## Appointment Cancellation
+When a customer asks to cancel an appointment:
+1. Say "Let me look that up for you."
+2. Call the cancelAppointment tool.
+3. If successful, confirm the cancellation with the date and time.
+4. If no appointment is found, apologize and offer to help with anything else.
+NEVER say "I don't see any appointments" without first trying the cancelAppointment tool.`,
+                `## Name Handling
+- Always ask for the caller's name early in the conversation if you don't already know it.
+- Your name is Anna — NEVER confuse your own name with the caller's name.
+- If a caller says "My name is not X" or corrects their name, acknowledge it and use the correct name going forward.`
             ].filter(Boolean).join('\n\n');
 
             // Return the specific Assistant ID and inject context into the System Prompt via overrides
@@ -453,6 +464,53 @@ This is critical because customers hang up if they don't know a transfer is happ
                             result: JSON.stringify(result)
                         });
                     } catch (e) {
+                        results.push({
+                            toolCallId: toolCall.id,
+                            result: JSON.stringify({ success: false, error: e.message })
+                        });
+                    }
+                }
+                // Handle cancelAppointment tool calls
+                else if (functionName === 'cancelAppointment') {
+                    try {
+                        const callerPhone = payload.message?.call?.customer?.number || '';
+                        logger.info('[VAPI] cancelAppointment tool called', { callerPhone });
+
+                        if (!callerPhone) {
+                            results.push({
+                                toolCallId: toolCall.id,
+                                result: JSON.stringify({ success: false, error: 'No caller phone number available' })
+                            });
+                        } else {
+                            const crmBaseUrl = process.env.CRM_BASE_URL || 'https://crm.asap.repair';
+                            const crmSecret = process.env.NEW_CRM_WEBHOOK_SECRET;
+                            const cancelRes = await fetch(`${crmBaseUrl}/api/vapi/cancel-appointment`, {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'X-Webhook-Secret': crmSecret,
+                                },
+                                body: JSON.stringify({ phone: callerPhone }),
+                            });
+                            const cancelData = await cancelRes.json();
+
+                            if (cancelData.success) {
+                                const tgMsg = `❌ <b>Appointment Cancelled via Voice AI</b>\nPhone: ${callerPhone}\nAppointment: ${cancelData.cancelled.title} on ${cancelData.cancelled.date} at ${cancelData.cancelled.time}`;
+                                await sendToTelegram(tgMsg, 'leads');
+
+                                results.push({
+                                    toolCallId: toolCall.id,
+                                    result: `Successfully cancelled the appointment on ${cancelData.cancelled.date} at ${cancelData.cancelled.time}. A confirmation SMS has been sent.`
+                                });
+                            } else {
+                                results.push({
+                                    toolCallId: toolCall.id,
+                                    result: cancelData.error || 'No upcoming appointments found to cancel. The customer may not have a booked appointment.'
+                                });
+                            }
+                        }
+                    } catch (e) {
+                        logger.error('[VAPI] cancelAppointment error', e);
                         results.push({
                             toolCallId: toolCall.id,
                             result: JSON.stringify({ success: false, error: e.message })
