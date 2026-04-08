@@ -761,9 +761,12 @@ app.post('/api/yelp-zapier', async (req, res) => {
             location: location || null,
         };
 
-        for (let attempt = 1; attempt <= 2; attempt++) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
             try {
-                const crmRes = await fetch(`${crmUrl}/api/webhooks/yelp`, {
+                if (attempt > 1) await new Promise(r => setTimeout(r, 3000 * attempt));
+                const targetUrl = `${crmUrl}/api/webhooks/yelp`;
+                logger.info(`CRM Yelp sync attempt ${attempt}`, { url: targetUrl, lead_id });
+                const crmRes = await fetch(targetUrl, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
