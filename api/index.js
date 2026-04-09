@@ -745,7 +745,29 @@ app.post('/api/yelp-zapier', async (req, res) => {
             conversationHistory: [],
         };
 
-        const systemPrompt = await buildSystemPrompt('yelp', contactContext);
+        let systemPrompt = await buildSystemPrompt('yelp', contactContext);
+
+        // Query LightRAG for additional context
+        try {
+            const ragUrl = process.env.LIGHTRAG_URL;
+            const ragKey = process.env.LIGHTRAG_API_KEY;
+            if (ragUrl) {
+                const ragRes = await fetch(`${ragUrl}/query`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-API-Key': ragKey || '' },
+                    body: JSON.stringify({ org_id: process.env.CRM_ORG_ID || '', query: `Yelp lead ${customerName}: ${effectiveMessage}`, mode: 'mix', top_k: 10 }),
+                    signal: AbortSignal.timeout(3000),
+                });
+                if (ragRes.ok) {
+                    const ragData = await ragRes.json();
+                    if (ragData?.context && ragData.context.length > 10) {
+                        systemPrompt += `\n\nKNOWLEDGE GRAPH CONTEXT:\n${ragData.context.substring(0, 1500)}`;
+                    }
+                }
+            }
+        } catch (ragErr) {
+            logger.warn('LightRAG query failed for Yelp Zapier', { error: ragErr.message });
+        }
 
         const completion = await ai.chat.completions.create({
             model: 'gpt-4o',
