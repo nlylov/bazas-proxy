@@ -14,6 +14,7 @@ const { getAvailableSlots, bookAppointment } = require('../lib/calendarService')
 const { logInfo, logError, logger } = require('../lib/utils/log');
 const { normalizePhone } = require('../lib/utils/phone');
 const { sendToTelegram, sendPhotoToTelegram, getTelegramChatId } = require('../lib/telegram');
+const { enqueue } = require('../lib/message-queue');
 
 
 const app = express();
@@ -217,6 +218,20 @@ async function processAssistantRun(req, res, threadId, run, { source, pageContex
                         let crmOk = false;
                         let crmContactId = null;
 
+                        const websitePayload = {
+                            name: args.name,
+                            phone: cleanPhone,
+                            email: args.email || '',
+                            zip: args.zip || '',
+                            service: args.service || '',
+                            date: args.preferred_date || '',
+                            address: args.address || '',
+                            message: [
+                                `Source: Chatbot${pageContext ? ` (${pageContext})` : ''}`,
+                                args.notes || '',
+                                hasPhoto ? 'Photo attached via chat' : '',
+                            ].filter(Boolean).join(' | '),
+                        };
                         if (crmSecret) {
                             try {
                                 const crmRes = await fetch(crmUrl, {
@@ -225,28 +240,24 @@ async function processAssistantRun(req, res, threadId, run, { source, pageContex
                                         'Content-Type': 'application/json',
                                         'X-Webhook-Secret': crmSecret,
                                     },
-                                    body: JSON.stringify({
-                                        name: args.name,
-                                        phone: cleanPhone,
-                                        email: args.email || '',
-                                        zip: args.zip || '',
-                                        service: args.service || '',
-                                        date: args.preferred_date || '',
-                                        address: args.address || '',
-                                        message: [
-                                            `Source: Chatbot${pageContext ? ` (${pageContext})` : ''}`,
-                                            args.notes || '',
-                                            hasPhoto ? 'Photo attached via chat' : '',
-                                        ].filter(Boolean).join(' | '),
-                                    }),
+                                    body: JSON.stringify(websitePayload),
                                 });
                                 if (crmRes.ok) {
                                     const crmData = await crmRes.json();
                                     crmOk = true;
                                     crmContactId = crmData.contactId || null;
+                                } else {
+                                    throw new Error(`CRM responded ${crmRes.status}`);
                                 }
                             } catch (err) {
-                                logger.error('CRM webhook error', { error: err.message });
+                                logger.error('CRM webhook error — queued for retry', { error: err.message });
+                                enqueue({
+                                    source: 'website',
+                                    endpoint: '/api/webhooks/website',
+                                    payload: websitePayload,
+                                    clientMessage: args.notes || args.service || '',
+                                    clientName: args.name,
+                                });
                             }
                         }
 
@@ -787,7 +798,7 @@ app.post('/api/yelp-zapier', async (req, res) => {
             'activity'
         );
 
-        // Sync lead to CRM (custom CRM, not GHL) — with retry & status checking
+        // Sync lead to CRM — inline retry (2 attempts), then queue for background retry
         let crmSynced = false;
         const crmPayload = {
             name: customerName,
@@ -800,9 +811,9 @@ app.post('/api/yelp-zapier', async (req, res) => {
             location: location || null,
         };
 
-        for (let attempt = 1; attempt <= 3; attempt++) {
+        for (let attempt = 1; attempt <= 2; attempt++) {
             try {
-                if (attempt > 1) await new Promise(r => setTimeout(r, 3000 * attempt));
+                if (attempt > 1) await new Promise(r => setTimeout(r, 2000));
                 const targetUrl = `${crmUrl}/api/webhooks/yelp`;
                 logger.info(`CRM Yelp sync attempt ${attempt}`, { url: targetUrl, lead_id });
                 const crmRes = await fetch(targetUrl, {
@@ -817,52 +828,35 @@ app.post('/api/yelp-zapier', async (req, res) => {
                 if (!crmRes.ok) {
                     const errBody = await crmRes.text().catch(() => '(no body)');
                     logger.error(`CRM Yelp sync FAILED (attempt ${attempt})`, {
-                        status: crmRes.status,
-                        body: errBody.substring(0, 300),
-                        lead_id,
-                        customerName,
+                        status: crmRes.status, body: errBody.substring(0, 300), lead_id, customerName,
                     });
-                    await sendToTelegram(
-                        `\u26a0\ufe0f <b>CRM Sync FAILED</b> (attempt ${attempt})\n` +
-                        `\ud83d\udc64 ${customerName}\n` +
-                        `\ud83c\udd94 Lead: ${lead_id || 'N/A'}\n` +
-                        `\u274c Status: ${crmRes.status}\n` +
-                        `\ud83d\udcdd Error: ${errBody.substring(0, 200)}`,
-                        'leads'
-                    );
-                    if (attempt < 2) {
-                        await new Promise(r => setTimeout(r, 2000)); // wait 2s before retry
-                        continue;
-                    }
-                } else {
-                    const crmData = await crmRes.json();
-                    crmSynced = true;
-                    logger.info('CRM Yelp sync OK', { contactId: crmData.contactId, conversationId: crmData.conversationId });
-                    break;
+                    continue;
                 }
+                const crmData = await crmRes.json();
+                crmSynced = true;
+                logger.info('CRM Yelp sync OK', { contactId: crmData.contactId, conversationId: crmData.conversationId });
+                break;
             } catch (crmErr) {
                 logger.error(`CRM Yelp sync EXCEPTION (attempt ${attempt})`, { error: crmErr.message, lead_id, customerName });
-                await sendToTelegram(
-                    `\u274c <b>CRM Sync EXCEPTION</b> (attempt ${attempt})\n` +
-                    `\ud83d\udc64 ${customerName}\n` +
-                    `\ud83c\udd94 Lead: ${lead_id || 'N/A'}\n` +
-                    `\ud83d\udca5 ${crmErr.message}`,
-                    'leads'
-                );
-                if (attempt < 2) {
-                    await new Promise(r => setTimeout(r, 2000));
-                }
             }
         }
 
         if (!crmSynced) {
+            enqueue({
+                source: 'yelp',
+                endpoint: '/api/webhooks/yelp',
+                payload: crmPayload,
+                aiResponse,
+                clientMessage: effectiveMessage,
+                clientName: customerName,
+            });
             await sendToTelegram(
-                `\ud83d\udea8 <b>LEAD NOT SAVED TO CRM!</b>\n` +
-                `\ud83d\udc64 ${customerName}\n` +
-                `\ud83d\udcf1 ${consumer_phone || 'No phone'}\n` +
-                `\ud83c\udd94 ${lead_id || 'No ID'}\n` +
-                `\ud83d\udd27 ${category || effectiveMessage.substring(0, 80)}\n` +
-                `\u2139\ufe0f The AI reply was sent to Yelp, but CRM has NO record of this lead. Manual entry needed.`,
+                `🚨 <b>LEAD QUEUED</b> (CRM down)\n` +
+                `👤 ${customerName}\n` +
+                `📱 ${consumer_phone || 'No phone'}\n` +
+                `🆔 ${lead_id || 'No ID'}\n` +
+                `🔧 ${category || effectiveMessage.substring(0, 80)}\n` +
+                `ℹ️ AI reply was sent to Yelp. Payload queued for background retry every 5 min.`,
                 'leads'
             );
         }
@@ -911,6 +905,51 @@ app.get('/api/health', (req, res) => res.json({
     hasTelegramChatId: !!process.env.TELEGRAM_ADMIN_ID,
     envKeys: Object.keys(process.env).filter(k => k.startsWith('TELEGRAM') || k.startsWith('RAILWAY') || k === 'NODE_ENV')
 }));
+
+// --- Queue status endpoint (auth via CRM_API_KEY) ---
+const { retryPending, getStatus: getQueueStatus } = require('../lib/message-queue');
+
+app.get('/api/queue-status', (req, res) => {
+    const apiKey = req.headers['x-api-key'] || req.query.key;
+    if (!apiKey || apiKey !== process.env.CRM_API_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    res.json(getQueueStatus());
+});
+
+app.post('/api/queue-retry', async (req, res) => {
+    const apiKey = req.headers['x-api-key'] || req.query.key;
+    if (!apiKey || apiKey !== process.env.CRM_API_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    const result = await retryPending();
+    res.json(result);
+});
+
+// --- Retry cron: every 5 minutes ---
+const cron = require('node-cron');
+cron.schedule('*/5 * * * *', async () => {
+    try {
+        const result = await retryPending();
+        if (result.delivered > 0 || result.failed > 0) {
+            logger.info('[Queue Cron] Retry results', result);
+            if (result.delivered > 0) {
+                await sendToTelegram(
+                    `✅ <b>Queue retry</b>: ${result.delivered} delivered, ${result.failed} failed, ${result.remaining} remaining`,
+                    'activity'
+                );
+            }
+            if (result.failed > 0) {
+                await sendToTelegram(
+                    `🚨 <b>Queue: ${result.failed} messages permanently failed</b> (3 attempts exhausted). Check /api/queue-status`,
+                    'activity'
+                );
+            }
+        }
+    } catch (err) {
+        logger.error('[Queue Cron] Error', { error: err.message });
+    }
+});
 
 // Export app and useful utility functions for other modules (like vapi.js)
 module.exports = {
