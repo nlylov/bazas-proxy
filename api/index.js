@@ -708,13 +708,24 @@ app.post('/api/yelp-zapier', async (req, res) => {
     try {
         const {
             consumer_name, consumer_phone, consumer_email,
-            message_content, message, lead_id, category, location
+            message_content, message, lead_id, category, location,
+            attachment_urls,
         } = req.body;
 
         const customerMessage = message_content || message || '';
         const customerName = consumer_name || 'Yelp Customer';
 
-        if (!customerMessage && !category) {
+        // Parse attachment URLs — Zapier may send as string, comma-separated, or array
+        let photoUrls = [];
+        if (attachment_urls) {
+            if (Array.isArray(attachment_urls)) {
+                photoUrls = attachment_urls.filter(Boolean);
+            } else if (typeof attachment_urls === 'string' && attachment_urls.trim()) {
+                photoUrls = attachment_urls.split(',').map(u => u.trim()).filter(Boolean);
+            }
+        }
+
+        if (!customerMessage && !category && photoUrls.length === 0) {
             return res.status(400).json({ error: 'Missing message_content or category' });
         }
 
@@ -780,11 +791,30 @@ app.post('/api/yelp-zapier', async (req, res) => {
             logger.warn('LightRAG query failed for Yelp Zapier', { error: ragErr.message });
         }
 
+        // Build user message — add vision blocks if customer sent photos
+        let userContent;
+        if (photoUrls.length > 0) {
+            userContent = [
+                {
+                    type: 'text',
+                    text: effectiveMessage
+                        ? `${effectiveMessage}\n\nThe customer sent ${photoUrls.length} photo(s). Analyze them carefully and give a SPECIFIC price estimate based on what you see. Mention 1-2 specific details from the photos to show you looked. Do NOT say "technician will evaluate" — YOU are evaluating now. Move toward booking.`
+                        : `The customer sent ${photoUrls.length} photo(s) for their ${category || 'service'} request. Analyze them and give a specific estimate.`,
+                },
+                ...photoUrls.map(url => ({
+                    type: 'image_url',
+                    image_url: { url, detail: 'low' },
+                })),
+            ];
+        } else {
+            userContent = effectiveMessage;
+        }
+
         const completion = await ai.chat.completions.create({
             model: 'gpt-4o',
             messages: [
                 { role: 'system', content: systemPrompt },
-                { role: 'user', content: effectiveMessage },
+                { role: 'user', content: userContent },
             ],
             max_tokens: 300,
             temperature: 0.7,
@@ -809,6 +839,7 @@ app.post('/api/yelp-zapier', async (req, res) => {
             lead_id: lead_id || null,
             ai_response: aiResponse,
             location: location || null,
+            attachment_urls: photoUrls.length > 0 ? photoUrls : undefined,
         };
 
         for (let attempt = 1; attempt <= 2; attempt++) {
