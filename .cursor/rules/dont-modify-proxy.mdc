@@ -1,0 +1,51 @@
+---
+description: Lockdown rule — bazas-proxy is decommission-mode forwarder only. All business logic lives in bazas-crm.
+alwaysApply: true
+---
+
+# bazas-proxy is in DECOMMISSION mode
+
+This repository is a **dumb HTTP forwarder** that forwards external vendor
+webhooks (VAPI, Zapier, Thumbtack) to `crm.asap.repair`. It exists ONLY because
+those vendor dashboards have hard-coded URLs pointing here that we cannot change
+instantly.
+
+## Hard rules
+
+1. **NEVER add business logic, AI calls, database access, or third-party
+   integrations to this repo.** Add them to `bazas-crm` instead.
+2. **NEVER modify** `api/vapi.legacy.js` — it is a frozen reference of the
+   pre-decommission implementation kept only for emergency rollback.
+3. The ONLY legitimate edits here are:
+   - Adding a new forwarder route (one-liner using `forwardToCrm` from `lib/forwarder.js`)
+   - Removing a forwarder once the corresponding vendor URL has been migrated off
+   - Bumping `FORWARD_TARGET_BASE` env var
+
+## Where to actually go
+
+| Topic | Repository |
+|-------|-----------|
+| Anything VAPI / voice / phone | `bazas-crm/app/api/vapi/*`, `bazas-crm/app/api/twilio/*` |
+| Anything Yelp / Thumbtack / Google LSA / Email leads | `bazas-crm/app/api/webhooks/*` |
+| Website widgets / quote form | `bazas-crm/app/api/widget/*` |
+| Calendar / appointments | `bazas-crm/app/api/calendar/*` |
+| Knowledge base / pricing | `bazas-crm/lib/knowledge-base*` and Settings UI |
+| AI auto-reply / Judge rules | `bazas-crm/app/api/ai/*` |
+| Telegram notifications | `bazas-crm/lib/telegram-notify.ts` |
+| Frontend / static site | `asap.repair/` (Cloudflare Pages) |
+
+## If you think you need to debug something here
+
+99% of the time, you don't. The forwarder is ~100 lines of deterministic
+HTTP-passthrough. If a vendor webhook is broken, the bug is almost certainly
+in the corresponding CRM route, not here.
+
+To verify, hit both URLs with curl and compare responses:
+
+```bash
+curl -X POST https://repair-asap-proxy-production.up.railway.app/api/vapi/webhook -d '...'
+curl -X POST https://crm.asap.repair/api/vapi/webhook -d '...'
+```
+
+If responses match → the bug is in `bazas-crm`. Stop reading code here, switch
+repositories.
