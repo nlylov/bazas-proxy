@@ -699,17 +699,33 @@ function detectChannel(event) {
     return 'sms'; // default
 }
 
-// --- ROUTE: Yelp via Zapier (Direct AI auto-reply) ---
-// Zapier "New Consumer Message" → POST here → returns AI response → Zapier "Create Message"
+// --- ROUTE: Yelp via Zapier — FORWARDER MODE ---
+//
+// All Yelp processing (AI reply, KB, photo vision, dedup, SMS bridge, message persistence)
+// now lives in bazas-crm at POST /api/webhooks/yelp (PR #14).
+//
+// This route receives Zapier's "New Consumer Message" payload, transforms field names
+// to the CRM webhook contract, and forwards. The CRM responds with `{ generatedReply }`
+// (when AI generated something) and pushes the reply back to Yelp itself via the
+// ZAPIER_YELP_SEND_WEBHOOK Catch Hook, so this proxy no longer needs to manage delivery.
+//
+// To remove this hop entirely, point your Zapier "New Consumer Message" webhook at:
+//   https://app.bazas.ai/api/webhooks/yelp
+// and add the header `X-Webhook-Secret: <NEW_CRM_WEBHOOK_SECRET>`.
+// Then stop the Railway service `repair-asap-proxy-production`.
+//
+// The legacy implementation (proxy-side AI generation + LightRAG + CRM sync) is
+// preserved in git history (commit before this one) for emergency rollback.
 app.post('/api/yelp-zapier', async (req, res) => {
     const context = '/api/yelp-zapier';
-    logInfo(req, context, 'Yelp Zapier request received', { body: req.body });
+    logInfo(req, context, '[Forwarder] Yelp Zapier → CRM /api/webhooks/yelp', { body: req.body });
 
     try {
         const {
             consumer_name, consumer_phone, consumer_email,
-            message_content, message, lead_id, category, location
-        } = req.body;
+            message_content, message, lead_id, category, location,
+            attachment_urls,
+        } = req.body || {};
 
         const customerMessage = message_content || message || '';
         const customerName = consumer_name || 'Yelp Customer';
@@ -718,178 +734,86 @@ app.post('/api/yelp-zapier', async (req, res) => {
             return res.status(400).json({ error: 'Missing message_content or category' });
         }
 
-        // Build context message if the message is empty but we have category
-        const effectiveMessage = customerMessage ||
-            `Hi, I'm looking for help with ${category || 'a handyman service'}. ${location ? `Location: ${location}` : ''}`;
+        const crmBase = (process.env.FORWARD_TARGET_BASE || process.env.CRM_BASE_URL || 'https://crm.asap.repair').replace(/\/$/, '');
+        const crmSecret = process.env.NEW_CRM_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET || '';
+        const targetUrl = `${crmBase}/api/webhooks/yelp`;
 
-        // Check if AI is paused for this contact in CRM
-        const crmUrl = process.env.CRM_BASE_URL || 'https://crm.asap.repair';
-        try {
-            const pauseCheckUrl = `${crmUrl}/api/webhooks/yelp/check-pause?lead_id=${encodeURIComponent(lead_id || '')}&phone=${encodeURIComponent(consumer_phone || '')}`;
-            const pauseRes = await fetch(pauseCheckUrl, {
-                headers: { 'x-webhook-secret': process.env.NEW_CRM_WEBHOOK_SECRET || '' },
-            });
-            if (pauseRes.ok) {
-                const pauseData = await pauseRes.json();
-                if (pauseData.aiPaused || pauseData.dndAll) {
-                    logInfo(req, context, `AI paused/DND for contact — skipping auto-reply`, { lead_id, customerName });
-                    return res.json({ reply: '', skipped: true, reason: 'ai_paused' });
-                }
-            }
-        } catch (pauseErr) {
-            logger.warn('AI pause check failed (proceeding with reply)', { error: pauseErr.message });
-        }
-
-        // Fetch KB and generate AI response using the existing AI Hub
-        const { buildSystemPrompt, formatConversationHistory } = require('../lib/knowledge-base');
-        const { OpenAI: OpenAIClient } = require('openai');
-
-        const ai = new OpenAIClient({ apiKey: config.openai.apiKey });
-
-        const contactContext = {
-            name: customerName,
-            phone: consumer_phone || null,
-            email: consumer_email || null,
-            source: 'yelp',
-            tags: ['yelp', 'zapier-auto'],
-            notes: lead_id ? `Yelp Lead ID: ${lead_id}` : null,
-            conversationHistory: [],
-        };
-
-        let systemPrompt = await buildSystemPrompt('yelp', contactContext);
-
-        // Query LightRAG for additional context
-        try {
-            const ragUrl = process.env.LIGHTRAG_URL;
-            const ragKey = process.env.LIGHTRAG_API_KEY;
-            if (ragUrl) {
-                const ragRes = await fetch(`${ragUrl}/query`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'X-API-Key': ragKey || '' },
-                    body: JSON.stringify({ org_id: process.env.CRM_ORG_ID || '', query: `Yelp lead ${customerName}: ${effectiveMessage}`, mode: 'mix', top_k: 10 }),
-                    signal: AbortSignal.timeout(3000),
-                });
-                if (ragRes.ok) {
-                    const ragData = await ragRes.json();
-                    if (ragData?.context && ragData.context.length > 10) {
-                        systemPrompt += `\n\nKNOWLEDGE GRAPH CONTEXT:\n${ragData.context.substring(0, 1500)}`;
-                    }
-                }
-            }
-        } catch (ragErr) {
-            logger.warn('LightRAG query failed for Yelp Zapier', { error: ragErr.message });
-        }
-
-        const completion = await ai.chat.completions.create({
-            model: 'gpt-4o',
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: effectiveMessage },
-            ],
-            max_tokens: 300,
-            temperature: 0.7,
-        });
-
-        const aiResponse = completion.choices[0]?.message?.content?.trim() || '';
-
-        // Log to Telegram
-        await sendToTelegram(
-            `📨 <b>Yelp (Zapier)</b>\n👤 ${customerName}\n💬 ${effectiveMessage.substring(0, 200)}\n🤖 ${aiResponse.substring(0, 300)}`,
-            'activity'
-        );
-
-        // Sync lead to CRM — inline retry (2 attempts), then queue for background retry
-        let crmSynced = false;
+        // Transform Zapier payload → CRM webhook payload contract
         const crmPayload = {
             name: customerName,
             phone: consumer_phone ? normalizePhone(consumer_phone) : null,
             email: consumer_email || null,
             service: category || null,
-            message: effectiveMessage,
+            message: customerMessage || `Hi, I'm looking for help with ${category || 'a handyman service'}. ${location ? `Location: ${location}` : ''}`.trim(),
             lead_id: lead_id || null,
-            ai_response: aiResponse,
             location: location || null,
+            attachment_urls: attachment_urls || [],
         };
 
-        for (let attempt = 1; attempt <= 2; attempt++) {
-            try {
-                if (attempt > 1) await new Promise(r => setTimeout(r, 2000));
-                const targetUrl = `${crmUrl}/api/webhooks/yelp`;
-                logger.info(`CRM Yelp sync attempt ${attempt}`, { url: targetUrl, lead_id });
-                const crmRes = await fetch(targetUrl, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-webhook-secret': process.env.NEW_CRM_WEBHOOK_SECRET || '',
-                    },
-                    body: JSON.stringify(crmPayload),
-                });
-
-                if (!crmRes.ok) {
-                    const errBody = await crmRes.text().catch(() => '(no body)');
-                    logger.error(`CRM Yelp sync FAILED (attempt ${attempt})`, {
-                        status: crmRes.status, body: errBody.substring(0, 300), lead_id, customerName,
-                    });
-                    continue;
-                }
-                const crmData = await crmRes.json();
-                crmSynced = true;
-                logger.info('CRM Yelp sync OK', { contactId: crmData.contactId, conversationId: crmData.conversationId });
-                break;
-            } catch (crmErr) {
-                logger.error(`CRM Yelp sync EXCEPTION (attempt ${attempt})`, { error: crmErr.message, lead_id, customerName });
-            }
-        }
-
-        if (!crmSynced) {
-            enqueue({
-                source: 'yelp',
-                endpoint: '/api/webhooks/yelp',
-                payload: crmPayload,
-                aiResponse,
-                clientMessage: effectiveMessage,
-                clientName: customerName,
+        let upstreamStatus = 0;
+        let upstreamData = {};
+        try {
+            const upstream = await fetch(targetUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Webhook-Secret': crmSecret,
+                    'X-Forwarded-By': 'bazas-proxy',
+                },
+                body: JSON.stringify(crmPayload),
             });
+            upstreamStatus = upstream.status;
+            upstreamData = await upstream.json().catch(() => ({}));
+
+            if (!upstream.ok) {
+                logger.error('[Forwarder] CRM Yelp webhook returned non-2xx', {
+                    status: upstreamStatus, body: upstreamData, lead_id, customerName,
+                });
+                await sendToTelegram(
+                    `🚨 <b>Yelp forwarder: CRM returned ${upstreamStatus}</b>\n` +
+                    `👤 ${customerName}\n📱 ${consumer_phone || 'No phone'}\n🆔 ${lead_id || 'No ID'}\n` +
+                    `🔧 ${(category || customerMessage).substring(0, 80)}`,
+                    'leads'
+                );
+            } else {
+                logger.info('[Forwarder] Yelp → CRM OK', {
+                    contactId: upstreamData.contactId,
+                    conversationId: upstreamData.conversationId,
+                    aiReplied: !!upstreamData.generatedReply,
+                });
+            }
+        } catch (fwdErr) {
+            logger.error('[Forwarder] Yelp forward EXCEPTION', { error: fwdErr.message, lead_id, customerName });
             await sendToTelegram(
-                `🚨 <b>LEAD QUEUED</b> (CRM down)\n` +
-                `👤 ${customerName}\n` +
-                `📱 ${consumer_phone || 'No phone'}\n` +
-                `🆔 ${lead_id || 'No ID'}\n` +
-                `🔧 ${category || effectiveMessage.substring(0, 80)}\n` +
-                `ℹ️ AI reply was sent to Yelp. Payload queued for background retry every 5 min.`,
+                `🚨 <b>Yelp forwarder: CRM unreachable</b>\n` +
+                `👤 ${customerName}\n📱 ${consumer_phone || 'No phone'}\n🆔 ${lead_id || 'No ID'}\n` +
+                `❌ ${fwdErr.message}\n` +
+                `Sent fallback reply to Zapier.`,
                 'leads'
             );
+            return res.json({
+                success: false,
+                message: `Hi! Thank you for reaching out to Repair ASAP. We'd love to help! Could you share a few details about your project? Our team will get back to you with a quote shortly. You can also call us at (775) 310-7770.`,
+                error: fwdErr.message,
+                forwardedTo: targetUrl,
+            });
         }
 
-        // Send AI reply to Yelp via Zapier Catch Hook (replaces old Zapier Step 3)
-        const zapierSendUrl = process.env.ZAPIER_YELP_SEND_WEBHOOK;
-        if (zapierSendUrl && lead_id && aiResponse) {
-            try {
-                const zapRes = await fetch(zapierSendUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        lead_id: lead_id,
-                        message: aiResponse,
-                    }),
-                });
-                logger.info('Yelp reply sent via Catch Hook', { lead_id, status: zapRes.status });
-            } catch (zapErr) {
-                logger.warn('Yelp Catch Hook send failed', { error: zapErr.message });
-            }
-        }
-
-        // Return response (Zapier Step 3 no longer needed)
-        res.json({
-            success: true,
-            message: aiResponse,
+        // Acknowledgement back to Zapier. The CRM owns Yelp delivery now via
+        // its own ZAPIER_YELP_SEND_WEBHOOK call, so Zapier doesn't need the AI reply
+        // in this response. We still echo it for backwards compatibility with any
+        // older Zap that consumes `{message}` from this response.
+        return res.json({
+            success: upstreamStatus >= 200 && upstreamStatus < 300,
+            message: upstreamData.generatedReply || '',
             lead_id: lead_id || null,
             customer_name: customerName,
+            forwardedTo: targetUrl,
+            crmStatus: upstreamStatus,
         });
     } catch (error) {
-        logError(req, context, 'Yelp Zapier error', { error: error.message });
-        // Return a safe fallback message so Zapier can still respond
-        res.json({
+        logError(req, context, '[Forwarder] Yelp Zapier fatal error', { error: error.message });
+        return res.json({
             success: false,
             message: `Hi! Thank you for reaching out to Repair ASAP. We'd love to help! Could you share a few details about your project? Our team will get back to you with a quote shortly. You can also call us at (775) 310-7770.`,
             error: error.message,
