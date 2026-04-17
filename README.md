@@ -1,9 +1,15 @@
-# bazas-proxy — FORWARDER MODE
+# bazas-proxy — DECOMMISSIONING (forwarder-only)
 
+> **STOP — read [`AGENTS.md`](./AGENTS.md) before editing anything in this repo.**
+>
 > **Status: Decommissioning.** All business logic has been migrated to **bazas-crm**.
 > This service is kept alive only as a thin **forwarder** so that VAPI dashboard and Zapier
 > webhooks (which point at `repair-asap-proxy-production.up.railway.app/...`) keep working
-> without manual reconfiguration.
+> until the user updates those vendor dashboards.
+>
+> **To delete this service entirely**, follow the click-by-click checklist in
+> [`MIGRATION-PATH.md`](./MIGRATION-PATH.md). After updating 3 vendor URLs, this
+> Railway service can be stopped permanently.
 
 ## What is forwarded
 
