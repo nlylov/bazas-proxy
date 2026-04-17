@@ -15,6 +15,8 @@
 | `POST /api/vapi/outbound`  | `crm.asap.repair/api/vapi/outbound`  |
 | `POST /api/vapi/transfer`  | `crm.asap.repair/api/vapi/transfer`  |
 | `POST /api/yelp-zapier`    | `crm.asap.repair/api/webhooks/yelp` (with payload field-name transform) |
+| `POST /api/webhooks/thumbtack` | `crm.asap.repair/api/webhooks/thumbtack` |
+| `GET  /api/webhooks/thumbtack` | `crm.asap.repair/api/webhooks/thumbtack` |
 
 The forwarder target can be overridden with the env var `FORWARD_TARGET_BASE`
 (e.g. `https://app.bazas.ai` for the canonical platform URL).
