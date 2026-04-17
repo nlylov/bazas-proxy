@@ -7,6 +7,26 @@ const { fetchKnowledgeBase } = require('../lib/knowledge-base');
 const router = express.Router();
 
 /**
+ * Returns the current UTC offset string for America/New_York (e.g. "-05:00" or "-04:00").
+ */
+function getNYCOffset(dateStr) {
+    const d = dateStr ? new Date(dateStr + 'T12:00:00Z') : new Date();
+    const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York',
+        timeZoneName: 'shortOffset',
+    }).formatToParts(d);
+    const offsetPart = parts.find(p => p.type === 'timeZoneName');
+    if (offsetPart) {
+        const m = offsetPart.value.match(/GMT([+-]\d+)/);
+        if (m) {
+            const hrs = parseInt(m[1], 10);
+            return `${hrs < 0 ? '-' : '+'}${String(Math.abs(hrs)).padStart(2, '0')}:00`;
+        }
+    }
+    return '-05:00';
+}
+
+/**
  * Build a voice-friendly pricing prompt from KB data.
  * This overrides the hardcoded pricing in Vapi's assistant config.
  */
@@ -64,11 +84,14 @@ async function lookupContactByPhone(phone) {
         const resp = await fetch(
             `${crmBaseUrl}/api/contacts/lookup?phone=${encodeURIComponent(searchPhone)}`,
             {
-                headers: {
-                    'X-Webhook-Secret': crmSecret,
-                },
+                headers: { 'X-Webhook-Secret': crmSecret },
+                signal: AbortSignal.timeout(5000),
             }
         );
+        if (!resp.ok) {
+            logger.warn(`[VAPI] CRM lookup returned ${resp.status}`);
+            return null;
+        }
         const data = await resp.json();
         if (data?.found && data.id) {
             return {
@@ -76,6 +99,12 @@ async function lookupContactByPhone(phone) {
                 name: data.name || '',
                 email: data.email || '',
                 address: data.address || '',
+                phone: data.phone || searchPhone,
+                notes: data.notes || '',
+                status: data.status || 'lead',
+                jobCount: data.jobCount || 0,
+                recentJobs: data.recentJobs || [],
+                upcomingAppointments: data.upcomingAppointments || [],
             };
         }
     } catch (error) {
@@ -97,84 +126,81 @@ router.post('/webhook', async (req, res) => {
         // 1. Assistant Request (Before Call Starts) - Inject Context + KB Pricing
         if (type === 'assistant-request') {
             const customerNumber = payload.message?.call?.customer?.number;
-            let firstMessage = `Hi! This is Repair ASAP. How can I help you today?`;
+            let firstMessage = `Repair ASAP, this is Anna. How can I help?`;
             let customerName = '';
             let customerAddress = '';
             let crmContextPrompt = '';
-
-            if (customerNumber) {
-                const contact = await lookupContactByPhone(customerNumber);
-                if (contact && contact.name) {
-                    customerName = contact.name;
-                    customerAddress = contact.address || '';
-                    const firstName = contact.name.split(' ')[0];
-
-                    // Build CRM context for Anna's system prompt
-                    const contextParts = [];
-                    contextParts.push(`## Caller Context (from CRM)`);
-                    contextParts.push(`- Name: ${contact.name}`);
-                    if (contact.address) contextParts.push(`- Address on file: ${contact.address}`);
-                    if (contact.notes) contextParts.push(`- Notes: ${contact.notes}`);
-                    contextParts.push(`- Status: ${contact.status || 'lead'} (${contact.jobCount || 0} total jobs)`);
-
-                    // Recent jobs
-                    if (contact.recentJobs && contact.recentJobs.length > 0) {
-                        contextParts.push(`\n### Recent Jobs:`);
-                        contact.recentJobs.forEach((job, i) => {
-                            contextParts.push(`${i + 1}. "${job.title}" — status: ${job.status}`);
-                            if (job.description) contextParts.push(`   Description: ${job.description}`);
-                            if (job.scheduledDate) contextParts.push(`   Scheduled: ${new Date(job.scheduledDate).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}${job.scheduledTime ? ' at ' + job.scheduledTime : ''}`);
-                            if (job.address) contextParts.push(`   Job address: ${job.address}`);
-                            if (job.notes) contextParts.push(`   Internal notes: ${job.notes}`);
-                        });
-                    }
-
-                    // Upcoming appointments
-                    if (contact.upcomingAppointments && contact.upcomingAppointments.length > 0) {
-                        contextParts.push(`\n### Upcoming Appointments:`);
-                        contact.upcomingAppointments.forEach((apt, i) => {
-                            const date = new Date(apt.startTime).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
-                            const time = new Date(apt.startTime).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-                            contextParts.push(`${i + 1}. "${apt.title}" — ${date} at ${time} (${apt.status})`);
-                            if (apt.service) contextParts.push(`   Service: ${apt.service}`);
-                            if (apt.address) contextParts.push(`   Address: ${apt.address}`);
-                        });
-                    }
-
-                    contextParts.push(`\n### Instructions for returning callers:`);
-                    contextParts.push(`- Address the caller by first name: "${firstName}"`);
-                    contextParts.push(`- If they have active/scheduled jobs, reference them naturally. Example: "Are you calling about the [job title]?"`);
-                    contextParts.push(`- Never ask for information you already have (name, address, phone).`);
-                    contextParts.push(`- If same address as last time: "Same address as last time — [address], right?"`);
-
-                    crmContextPrompt = contextParts.join('\n');
-
-                    // Customize first message based on context
-                    const activeJob = (contact.recentJobs || []).find(j => j.status === 'scheduled' || j.status === 'in_progress');
-                    if (activeJob) {
-                        firstMessage = `Hi ${firstName}, this is Anna from Repair ASAP! Are you calling about the ${activeJob.title.toLowerCase()}?`;
-                    } else {
-                        firstMessage = `Hi ${firstName}, this is Anna from Repair ASAP! How can I help you today?`;
-                    }
-
-                    logger.info(`[VAPI] CRM context loaded for ${firstName}: ${contact.jobCount} jobs, ${(contact.recentJobs || []).length} recent, ${(contact.upcomingAppointments || []).length} appointments`);
-                }
-            }
-
-            // Fetch KB data for dynamic pricing
             let kbPricingPrompt = '';
-            try {
-                const kb = await fetchKnowledgeBase();
-                kbPricingPrompt = buildVoicePricingPrompt(kb);
-                if (kbPricingPrompt) {
-                    logger.info(`[VAPI] Injected KB pricing (${kb?.services?.length || 0} services) into Anna's prompt`);
+            let ragContextPrompt = '';
+
+            // Run CRM lookup, KB fetch, and RAG query in parallel
+            const [contactResult, kbResult] = await Promise.allSettled([
+                customerNumber ? lookupContactByPhone(customerNumber) : Promise.resolve(null),
+                fetchKnowledgeBase().catch(() => null),
+            ]);
+
+            const contact = contactResult.status === 'fulfilled' ? contactResult.value : null;
+            const kb = kbResult.status === 'fulfilled' ? kbResult.value : null;
+
+            if (contact && contact.name) {
+                customerName = contact.name;
+                customerAddress = contact.address || '';
+                const firstName = contact.name.split(' ')[0];
+
+                const contextParts = [];
+                contextParts.push(`## Caller Context (from CRM)`);
+                contextParts.push(`- Name: ${contact.name}`);
+                if (contact.address) contextParts.push(`- Address on file: ${contact.address}`);
+                if (contact.notes) contextParts.push(`- Notes: ${contact.notes}`);
+                contextParts.push(`- Status: ${contact.status || 'lead'} (${contact.jobCount || 0} total jobs)`);
+
+                if (contact.recentJobs && contact.recentJobs.length > 0) {
+                    contextParts.push(`\n### Recent Jobs:`);
+                    contact.recentJobs.forEach((job, i) => {
+                        contextParts.push(`${i + 1}. "${job.title}" — status: ${job.status}`);
+                        if (job.description) contextParts.push(`   Description: ${job.description}`);
+                        if (job.scheduledDate) contextParts.push(`   Scheduled: ${new Date(job.scheduledDate).toLocaleDateString('en-US', { timeZone: 'America/New_York', weekday: 'long', month: 'short', day: 'numeric' })}${job.scheduledTime ? ' at ' + job.scheduledTime : ''}`);
+                        if (job.address) contextParts.push(`   Job address: ${job.address}`);
+                        if (job.notes) contextParts.push(`   Internal notes: ${job.notes}`);
+                    });
                 }
-            } catch (kbErr) {
-                logger.warn('[VAPI] KB fetch failed, using Vapi built-in pricing', kbErr.message);
+
+                if (contact.upcomingAppointments && contact.upcomingAppointments.length > 0) {
+                    contextParts.push(`\n### Upcoming Appointments:`);
+                    contact.upcomingAppointments.forEach((apt, i) => {
+                        const date = new Date(apt.startTime).toLocaleDateString('en-US', { timeZone: 'America/New_York', weekday: 'long', month: 'short', day: 'numeric' });
+                        const time = new Date(apt.startTime).toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: 'numeric', minute: '2-digit' });
+                        contextParts.push(`${i + 1}. "${apt.title}" — ${date} at ${time} (${apt.status})`);
+                        if (apt.service) contextParts.push(`   Service: ${apt.service}`);
+                        if (apt.address) contextParts.push(`   Address: ${apt.address}`);
+                    });
+                }
+
+                contextParts.push(`\n### Instructions for returning callers:`);
+                contextParts.push(`- Address the caller by first name: "${firstName}"`);
+                contextParts.push(`- If they have active/scheduled jobs, reference them naturally. Example: "Are you calling about the [job title]?"`);
+                contextParts.push(`- Never ask for information you already have (name, address, phone).`);
+                contextParts.push(`- If same address as last time: "Same address as last time — [address], right?"`);
+
+                crmContextPrompt = contextParts.join('\n');
+
+                const activeJob = (contact.recentJobs || []).find(j => j.status === 'scheduled' || j.status === 'in_progress');
+                if (activeJob) {
+                    firstMessage = `Hi ${firstName}, this is Anna from Repair ASAP! Are you calling about the ${activeJob.title.toLowerCase()}?`;
+                } else {
+                    firstMessage = `Hi ${firstName}, this is Anna from Repair ASAP! How can I help you today?`;
+                }
+
+                logger.info(`[VAPI] CRM context loaded for ${firstName}: ${contact.jobCount} jobs, ${(contact.recentJobs || []).length} recent, ${(contact.upcomingAppointments || []).length} appointments`);
             }
 
-            // Query LightRAG knowledge graph for caller context
-            let ragContextPrompt = '';
+            // Build KB pricing prompt (already resolved in parallel)
+            kbPricingPrompt = buildVoicePricingPrompt(kb);
+            if (kbPricingPrompt) {
+                logger.info(`[VAPI] Injected KB pricing (${kb?.services?.length || 0} services) into Anna's prompt`);
+            }
+
+            // RAG query runs after contact lookup (needs customer name for better query)
             try {
                 const ragUrl = process.env.LIGHTRAG_URL;
                 const ragKey = process.env.LIGHTRAG_API_KEY;
@@ -200,7 +226,6 @@ router.post('/webhook', async (req, res) => {
                 logger.warn('[VAPI] RAG query failed (non-critical):', ragErr.message);
             }
 
-            // Build the system prompt override (CRM context + KB pricing + transfer protocol)
             const systemOverride = [
                 crmContextPrompt,
                 kbPricingPrompt,
@@ -208,8 +233,8 @@ router.post('/webhook', async (req, res) => {
                 `## CRITICAL: Call Transfer Protocol
 When a customer asks to speak with a person, a manager, customer service, or anyone else:
 1. FIRST say: "Sure, let me connect you right now. Please stay on the line — it will ring for just a moment."
-2. THEN call the transferToHuman tool.
-3. NEVER call transferToHuman without first telling the customer to stay on the line.
+2. THEN immediately call the transferToHuman tool. You ALWAYS have the ability to transfer calls.
+3. NEVER say you cannot transfer calls. You CAN and MUST transfer when asked.
 4. NEVER just silently transfer — always give a verbal warning first.
 This is critical because customers hang up if they don't know a transfer is happening.`,
                 `## Appointment Cancellation
@@ -219,13 +244,26 @@ When a customer asks to cancel an appointment:
 3. If successful, confirm the cancellation with the date and time.
 4. If no appointment is found, apologize and offer to help with anything else.
 NEVER say "I don't see any appointments" without first trying the cancelAppointment tool.`,
-                `## Name Handling
-- Always ask for the caller's name early in the conversation if you don't already know it.
+                `## Knowledge Base Lookup
+When a customer asks about services, pricing, policies, or anything you're not 100% sure about:
+1. Say "Let me check that for you" or "One moment."
+2. Call the searchKnowledgeBase tool with their specific question.
+3. Use the returned information to give an accurate answer.
+Do NOT guess about pricing or service details — always verify with the tool.`,
+                `## Email Collection
+IMPORTANT: Do NOT ask customers to spell out their email address over the phone.
+Instead, say: "I'll send you a quick text message where you can type in your email — much easier than spelling it out!"
+Then proceed with the booking using the phone number. The email can be collected via SMS after the call.
+If the customer insists on giving their email verbally, accept it, but always offer the SMS option first.`,
+                `## Conversation Style Rules
+- NEVER repeat the phrase "Thank you, I've made a note of that" more than once per call. Use varied acknowledgments: "Got it!", "Perfect!", "Noted!", "Great, thanks!"
+- NEVER ask what timezone the caller is in. We operate in New York City — always assume Eastern Time.
+- Keep responses concise and natural. Avoid long robotic scripts.
 - Your name is Anna — NEVER confuse your own name with the caller's name.
-- If a caller says "My name is not X" or corrects their name, acknowledge it and use the correct name going forward.`
+- Always ask for the caller's name early if you don't already know it.
+- If a caller corrects their name, acknowledge it and use the correct name going forward.`
             ].filter(Boolean).join('\n\n');
 
-            // Return the specific Assistant ID and inject context into the System Prompt via overrides
             return res.json({
                 assistantId: "2d0ec368-7ab0-4b0e-a516-78157cb96b0c",
                 assistantOverrides: {
@@ -234,7 +272,6 @@ NEVER say "I don't see any appointments" without first trying the cancelAppointm
                         name: customerName,
                         address: customerAddress
                     },
-                    // Append KB pricing + transfer instructions to the system prompt
                     model: {
                         provider: "openai",
                         model: "gpt-4o-mini",
@@ -259,25 +296,15 @@ NEVER say "I don't see any appointments" without first trying the cancelAppointm
 
             logger.info('Call ended', { customerNumber, summary });
 
-            // Send notification to Telegram → Leads group (calls need immediate attention)
-            let safeTranscript = transcript ? transcript.substring(0, 3800) : 'No transcript';
-            if (transcript.length > 3800) safeTranscript += '... [Truncated due to Telegram limits]';
-
-            const tgMessage = `📞 <b>Vapi AI Call Ended</b>\nPhone: ${customerNumber || 'Unknown'}\n\n<b>Summary:</b>\n${summary || 'No summary'}\n\n<b>Recording:</b>\n${recordingUrl || 'No recording'}\n\n<b>Transcript:</b>\n${safeTranscript}`;
-            await sendToTelegram(tgMessage, 'leads');
-
-            // Save call data to CRM (via transcript endpoint only — single source of truth)
+            // Save call data to CRM FIRST (critical path — must not be blocked by Telegram)
             if (customerNumber) {
-                const crmBaseUrl = process.env.CRM_BASE_URL; // e.g. https://app.bazas.ai
+                const crmBaseUrl = process.env.CRM_BASE_URL;
                 if (crmBaseUrl) {
                     try {
-                        // Look up caller name from CRM
                         let callerName = '';
                         try {
                             const contact = await lookupContactByPhone(customerNumber);
-                            if (contact && contact.name) {
-                                callerName = contact.name;
-                            }
+                            if (contact && contact.name) callerName = contact.name;
                         } catch (lookupErr) {
                             logger.warn('CRM contact lookup failed during call save', lookupErr.message);
                         }
@@ -298,9 +325,13 @@ NEVER say "I don't see any appointments" without first trying the cancelAppointm
                             source: 'vapi',
                         };
 
+                        const crmSecret = process.env.NEW_CRM_WEBHOOK_SECRET;
                         const crmResponse = await fetch(`${crmBaseUrl}/api/twilio/voice/transcript`, {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
+                            headers: {
+                                'Content-Type': 'application/json',
+                                ...(crmSecret ? { 'X-Webhook-Secret': crmSecret } : {}),
+                            },
                             body: JSON.stringify(crmPayload),
                         });
 
@@ -314,6 +345,13 @@ NEVER say "I don't see any appointments" without first trying the cancelAppointm
                     }
                 }
             }
+
+            // Telegram notification is fire-and-forget (non-critical)
+            let safeTranscript = transcript ? transcript.substring(0, 3800) : 'No transcript';
+            if (transcript.length > 3800) safeTranscript += '... [Truncated due to Telegram limits]';
+
+            const tgMessage = `📞 <b>Vapi AI Call Ended</b>\nPhone: ${customerNumber || 'Unknown'}\n\n<b>Summary:</b>\n${summary || 'No summary'}\n\n<b>Recording:</b>\n${recordingUrl || 'No recording'}\n\n<b>Transcript:</b>\n${safeTranscript}`;
+            sendToTelegram(tgMessage, 'leads').catch(err => logger.warn('[VAPI] Telegram notification failed (non-critical)', err.message));
 
             return res.json({ success: true });
         }
@@ -366,14 +404,16 @@ NEVER say "I don't see any appointments" without first trying the cancelAppointm
 
                         logger.info('Initiating warm transfer from webhook', { callSid, target, callerName, summary });
 
-                        // Call the CRM transfer endpoint
                         const crmBaseUrl = process.env.CRM_BASE_URL || 'https://app.bazas.ai';
-                        console.log(`[TRANSFER] Step 1: calling CRM at ${crmBaseUrl}/api/twilio/voice/transfer`);
-                        console.log(`[TRANSFER] Payload:`, JSON.stringify({ callSid, target, callerName, callerPhone, summary }));
+                        const crmSecret = process.env.NEW_CRM_WEBHOOK_SECRET;
+                        logger.info(`[TRANSFER] calling CRM transfer endpoint`);
                         
                         const transferResponse = await fetch(`${crmBaseUrl}/api/twilio/voice/transfer`, {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
+                            headers: {
+                                'Content-Type': 'application/json',
+                                ...(crmSecret ? { 'X-Webhook-Secret': crmSecret } : {}),
+                            },
                             body: JSON.stringify({
                                 callSid,
                                 target,
@@ -383,43 +423,39 @@ NEVER say "I don't see any appointments" without first trying the cancelAppointm
                             }),
                         });
 
-                        console.log(`[TRANSFER] Step 2: CRM responded with status ${transferResponse.status}`);
+                        logger.info(`[TRANSFER] CRM responded with status ${transferResponse.status}`);
                         
-                        // Safe JSON parsing - read as text first
                         const responseText = await transferResponse.text();
-                        console.log(`[TRANSFER] Step 3: CRM body (first 500 chars): ${responseText.substring(0, 500)}`);
-                        
                         let transferData;
                         try {
                             transferData = JSON.parse(responseText);
                         } catch (parseErr) {
-                            console.error(`[TRANSFER] CRM returned non-JSON: ${responseText.substring(0, 200)}`);
+                            logger.error('[TRANSFER] CRM returned non-JSON response');
                             results.push({
                                 toolCallId: toolCall.id,
-                                result: `I was unable to transfer the call right now. Please let the customer know that ${target === 'nikita' ? 'Nikita' : 'our team'} will call them back shortly.`
+                                result: `I was unable to transfer the call right now. Please let the customer know that our team will call them back shortly.`
                             });
                             continue;
                         }
 
                         if (transferResponse.ok && transferData.success) {
-                            console.log(`[TRANSFER] SUCCESS: transferred to ${transferData.target}`);
-                            const tgMsg = `📞➡️ <b>Call Transfer</b>\nCaller: ${callerName} (${callerPhone})\nTransferred to: ${transferData.target}\nReason: ${summary}`;
-                            await sendToTelegram(tgMsg, 'leads');
+                            logger.info(`[TRANSFER] SUCCESS: transferred to ${transferData.target}`);
+                            const tgMsg = `📞➡️ <b>Call Transfer</b>\nCaller: ${callerName}\nTransferred to: ${transferData.target}\nReason: ${summary}`;
+                            sendToTelegram(tgMsg, 'leads').catch(err => logger.warn('[TRANSFER] Telegram notification failed', err.message));
 
                             results.push({
                                 toolCallId: toolCall.id,
                                 result: `Successfully connecting the caller to ${transferData.target}. The call is being transferred now.`
                             });
                         } else {
-                            console.error(`[TRANSFER] FAILED: status=${transferResponse.status} data=${JSON.stringify(transferData)}`);
+                            logger.error('[TRANSFER] CRM transfer failed', { status: transferResponse.status });
                             results.push({
                                 toolCallId: toolCall.id,
-                                result: `I was unable to transfer the call right now. Please let the customer know that ${target === 'nikita' ? 'Nikita' : 'our team'} will call them back shortly.`
+                                result: `I was unable to transfer the call right now. Please let the customer know that our team will call them back shortly.`
                             });
                         }
                     } catch (e) {
-                        console.error(`[TRANSFER] EXCEPTION: ${e.name}: ${e.message}`);
-                        console.error(`[TRANSFER] STACK: ${e.stack}`);
+                        logger.error('[TRANSFER] Exception during transfer', e);
                         results.push({
                             toolCallId: toolCall.id,
                             result: 'Sorry, there was a technical error with the transfer. Please take the customer\'s number.'
@@ -464,7 +500,7 @@ NEVER say "I don't see any appointments" without first trying the cancelAppointm
                                 : (toolCall.function.arguments || {});
                         } catch (e) { }
 
-                        const startTime = `${args.date}T${args.time || '10:00'}:00-05:00`;
+                        const startTime = `${args.date}T${args.time || '10:00'}:00${getNYCOffset(args.date)}`;
                         const callerPhone = payload.message?.call?.customer?.number || '';
 
                         // Look up contact to get contactId
@@ -554,16 +590,25 @@ NEVER say "I don't see any appointments" without first trying the cancelAppointm
                         if (callerPhone) {
                             const contact = await lookupContactByPhone(callerPhone);
                             if (contact && contact.name) {
-                                logger.info('[VAPI] lookupCaller found contact', { name: contact.name });
-                                results.push({
-                                    toolCallId: toolCall.id,
-                                    result: JSON.stringify({
-                                        found: true,
-                                        name: contact.name,
-                                        address: contact.address || '',
-                                        isReturningCustomer: true,
-                                    })
-                                });
+                                logger.info('[VAPI] lookupCaller found contact', { name: contact.name, jobs: contact.jobCount });
+                                const result = {
+                                    found: true,
+                                    name: contact.name,
+                                    email: contact.email || '',
+                                    address: contact.address || '',
+                                    status: contact.status || 'lead',
+                                    jobCount: contact.jobCount || 0,
+                                    isReturningCustomer: (contact.jobCount || 0) > 0,
+                                };
+                                if (contact.recentJobs?.length > 0) {
+                                    result.recentJobs = contact.recentJobs.map(j => `${j.title} (${j.status})`).join('; ');
+                                }
+                                if (contact.upcomingAppointments?.length > 0) {
+                                    result.upcomingAppointments = contact.upcomingAppointments.map(a =>
+                                        `${a.title} on ${new Date(a.startTime).toLocaleDateString('en-US', { timeZone: 'America/New_York', weekday: 'short', month: 'short', day: 'numeric' })}`
+                                    ).join('; ');
+                                }
+                                results.push({ toolCallId: toolCall.id, result: JSON.stringify(result) });
                             } else {
                                 results.push({
                                     toolCallId: toolCall.id,
@@ -591,6 +636,85 @@ NEVER say "I don't see any appointments" without first trying the cancelAppointm
                         results.push({
                             toolCallId: toolCall.id,
                             result: JSON.stringify({ found: false, name: '', address: '', isReturningCustomer: false })
+                        });
+                    }
+                }
+                // Handle searchKnowledgeBase — mid-call RAG for specific questions
+                else if (functionName === 'searchKnowledgeBase') {
+                    try {
+                        let args = {};
+                        try {
+                            args = typeof toolCall.function.arguments === 'string'
+                                ? JSON.parse(toolCall.function.arguments)
+                                : (toolCall.function.arguments || {});
+                        } catch (e) { }
+
+                        const question = args.question || args.query || '';
+                        logger.info(`[VAPI] searchKnowledgeBase called: "${question}"`);
+
+                        if (!question) {
+                            results.push({ toolCallId: toolCall.id, result: 'No question provided.' });
+                            continue;
+                        }
+
+                        // Try LightRAG first (fast vector search for voice), fall back to KB
+                        let answer = '';
+                        const ragUrl = process.env.LIGHTRAG_URL;
+                        const ragKey = process.env.LIGHTRAG_API_KEY;
+
+                        if (ragUrl) {
+                            try {
+                                const ragRes = await fetch(`${ragUrl}/query`, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json', 'X-API-Key': ragKey || '' },
+                                    body: JSON.stringify({
+                                        org_id: process.env.CRM_ORG_ID || '',
+                                        query: question,
+                                        mode: 'hybrid',
+                                        top_k: 5,
+                                        only_context: true,
+                                    }),
+                                    signal: AbortSignal.timeout(5000),
+                                });
+                                if (ragRes.ok) {
+                                    const ragData = await ragRes.json();
+                                    const ctx = ragData.context || ragData.response || '';
+                                    if (ctx.length > 20) {
+                                        answer = ctx.substring(0, 2000);
+                                        logger.info(`[VAPI] RAG mid-call context: ${ctx.length} chars`);
+                                    }
+                                }
+                            } catch (ragErr) {
+                                logger.warn('[VAPI] Mid-call RAG failed, trying KB fallback', ragErr.message);
+                            }
+                        }
+
+                        // Fallback: check KB pricing data
+                        if (!answer) {
+                            try {
+                                const kb = await fetchKnowledgeBase();
+                                if (kb) {
+                                    const parts = [];
+                                    if (kb.services) parts.push('Services: ' + kb.services.map(s => `${s.name}: ${s.priceRange}`).join('; '));
+                                    if (kb.policies?.doNotDo) parts.push('We do NOT do: ' + kb.policies.doNotDo);
+                                    if (kb.policies?.minimumVisit) parts.push('Minimum visit: ' + kb.policies.minimumVisit);
+                                    if (kb.policies?.warranty) parts.push('Warranty: ' + kb.policies.warranty);
+                                    answer = parts.join('\n');
+                                }
+                            } catch (kbErr) {
+                                logger.warn('[VAPI] KB fallback also failed', kbErr.message);
+                            }
+                        }
+
+                        results.push({
+                            toolCallId: toolCall.id,
+                            result: answer || 'I could not find specific information about that. Please offer to have a team member follow up with details.'
+                        });
+                    } catch (e) {
+                        logger.error('[VAPI] searchKnowledgeBase error', e);
+                        results.push({
+                            toolCallId: toolCall.id,
+                            result: 'Knowledge base lookup failed. Please offer general information or a callback.'
                         });
                     }
                 }
@@ -835,7 +959,7 @@ router.post('/book', async (req, res) => {
             });
         }
 
-        const startTime = `${date}T${time}:00-05:00`;
+        const startTime = `${date}T${time}:00${getNYCOffset(date)}`;
         const bookingResult = await bookAppointment({
             contactId,
             startTime,
@@ -978,11 +1102,14 @@ router.post('/transfer', async (req, res) => {
 
         logger.info('Initiating warm transfer', { callSid, target, callerName, summary });
 
-        // Call the CRM transfer endpoint
         const crmBaseUrl = process.env.CRM_BASE_URL || 'https://app.bazas.ai';
+        const crmSecret = process.env.NEW_CRM_WEBHOOK_SECRET;
         const transferResponse = await fetch(`${crmBaseUrl}/api/twilio/voice/transfer`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                'Content-Type': 'application/json',
+                ...(crmSecret ? { 'X-Webhook-Secret': crmSecret } : {}),
+            },
             body: JSON.stringify({
                 callSid,
                 target,
