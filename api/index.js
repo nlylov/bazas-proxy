@@ -519,6 +519,19 @@ const aiHub = require('../lib/ai-hub');
 const vapiHub = require('./vapi');
 app.use('/api/vapi', vapiHub);
 
+// --- ROUTE: Thumbtack webhook — FORWARDER MODE ---
+//
+// Thumbtack ingestion (lead/message/negotiation events, AI auto-reply, SMS
+// bridge, contact persistence) lives in bazas-crm at /api/webhooks/thumbtack.
+// This route exists so that if Thumbtack's registered webhook URL points at
+// this proxy host, requests still get delivered to the CRM transparently.
+//
+// Forwards: POST/GET /api/webhooks/thumbtack → crm.asap.repair/api/webhooks/thumbtack
+// Override target with env var FORWARD_TARGET_BASE.
+const { forwardToCrm: forwardToCrmHelper } = require('../lib/forwarder');
+app.post('/api/webhooks/thumbtack', (req, res) => forwardToCrmHelper(req, res, '/api/webhooks/thumbtack'));
+app.get('/api/webhooks/thumbtack', (req, res) => forwardToCrmHelper(req, res, '/api/webhooks/thumbtack'));
+
 // --- Deduplication + Burst Throttle ---
 // Prevents double-response when both "Tag Added" + "Customer Replied" fire simultaneously.
 // Also prevents back-to-back responses when a customer sends 2 messages within 90 seconds.
