@@ -385,6 +385,7 @@ app.post('/api/thread', async (req, res) => {
         await sendToTelegram(`🆕 <b>New Chat Started!</b>\nThread ID: <code>${thread.id}</code>`, 'activity');
         res.json({ threadId: thread.id });
     } catch (error) {
+        logError(req, '/api/thread', 'Thread creation failed', error);
         res.status(500).json({ error: 'Failed to create thread' });
     }
 });
